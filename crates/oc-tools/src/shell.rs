@@ -83,16 +83,32 @@ fn resolve_windows() -> Result<Shell, String> {
     Err("未检测到 Git Bash（bash.exe），请安装 Git for Windows".to_string())
 }
 
-/// 探测 `prog` 是否可执行：spawn `--version` 并看退出码。
+/// 探测 `prog` 是否为 Git Bash（而非 WSL shim）。
+///
+/// WSL 装过的机器上 `C:\Windows\System32\bash.exe` 是 WSL shim，`--version` 同样退出 0，
+/// 但其版本三元组是 `linux-gnu`；Git for Windows 的 bash 是 `pc-cygwin`。
+/// 必须读输出区分，否则 exec 会静默跑进 WSL 的 Linux rootfs，`C:\...` 路径与
+/// Windows 原生命令全部失效。
 #[cfg(windows)]
 fn bash_probe(prog: &str) -> bool {
-    std::process::Command::new(prog)
+    use std::io::Read;
+    let Ok(out) = std::process::Command::new(prog)
         .arg("--version")
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let mut s = String::new();
+    if std::io::Cursor::new(out.stdout).read_to_string(&mut s).is_err() {
+        return false;
+    }
+    // Git Bash 三元组是 pc-cygwin；WSL shim 是 linux-gnu。宁漏勿错：非 pc-cygwin 一律不收。
+    s.contains("pc-cygwin") && !s.contains("linux-gnu")
 }
 
 /// 读 `HKLM\SOFTWARE\GitForWindows` 的 `InstallPath`，拼 `\bin\bash.exe` 且需存在。

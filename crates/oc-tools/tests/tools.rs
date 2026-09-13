@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 async fn exec_safe_command_runs() {
     let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::from_secs(30), Shell::resolve().unwrap());
     let cx = ToolCtx::detached(CancellationToken::new());
-    // echo 在 cmd.exe 与 POSIX sh 下写法一致，无需按平台分支。
+    // echo 在 Git Bash 与 POSIX sh 下写法一致，无需按平台分支。
     let echo = "echo hello";
     let out = tool
         .invoke(serde_json::json!({ "command": echo }), cx)
