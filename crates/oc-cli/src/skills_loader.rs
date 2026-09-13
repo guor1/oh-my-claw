@@ -175,7 +175,13 @@ mod tests {
     }
 
     /// 非 UTF-8 目录名跳过（带 warn），不得加载成 name/slug 为空的技能。
-    #[cfg(unix)]
+    /// 非 UTF-8 目录名应被 loader 跳过。
+    ///
+    /// 排除 macOS：APFS/HFS+ **强制文件名为 UTF-8**，`create_dir_all` 遇到 `0xFF`
+    /// 直接返回 `EILSEQ`（errno 92, Illegal byte sequence），测试的前提在那里根本
+    /// 无法构造——不是 loader 有问题，是这种目录名在 macOS 上不可能存在。
+    /// Linux 的文件名是任意字节串，才有这条路径要防。
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn non_utf8_dir_name_is_skipped() {
         use std::ffi::OsString;
