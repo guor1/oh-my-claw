@@ -228,7 +228,7 @@ mod tests {
     fn platform_in_stable_prefix() {
         let with = PromptInputs {
             soul: "你是 oc。",
-            platform: "OS: Windows；shell: cmd.exe（用 cmd 语法，勿用 Unix 语法）。",
+            platform: "操作系统：Windows。exec 工具通过 Git Bash（bash -c）执行命令。",
             model: "",
             provider: "",
             endpoint: None,
@@ -239,9 +239,9 @@ mod tests {
         };
         let r = render_system_prompt(&with);
         assert!(r.stable_prefix.contains("# 运行环境"));
-        assert!(r.stable_prefix.contains("cmd.exe"));
+        assert!(r.stable_prefix.contains("bash"));
         // 平台是稳定信息，不应进易变尾部。
-        assert!(!r.volatile_suffix.contains("cmd.exe"));
+        assert!(!r.volatile_suffix.contains("bash"));
     }
 
     #[test]

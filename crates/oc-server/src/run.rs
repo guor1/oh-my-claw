@@ -832,9 +832,8 @@ fn render_prompt(ctx: &RunCtx) -> String {
 /// 运行环境提示：告诉模型 exec 工具的目标 OS / shell，避免写错命令语法。
 /// 编译期按目标平台确定。
 #[cfg(windows)]
-const PLATFORM_HINT: &str = "操作系统：Windows。exec 工具通过 `cmd.exe /C` 执行命令，\
-请使用 Windows/cmd 命令语法，不要使用 Unix/bash 语法（例如取当前时间用 `date /T & time /T`，\
-不要用 `date '+%Y-%m-%d'`）。";
+const PLATFORM_HINT: &str = "操作系统：Windows。exec 工具通过 Git Bash（`bash -c`）执行命令，\
+请使用 POSIX/bash 语法（例如取当前时间用 `date '+%F %T'`，不要用 `date /T & time /T`）。";
 #[cfg(not(windows))]
 const PLATFORM_HINT: &str = "操作系统：类 Unix（Linux/macOS）。exec 工具通过 `sh -c` 执行命令，\
 请使用 POSIX shell 语法。";

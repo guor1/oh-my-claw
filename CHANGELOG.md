@@ -12,6 +12,9 @@
 ### Fixed
 - cron day-of-month / day-of-week 字段都非 `*` 时由 AND 改为 OR（BUG-1）。「每月 1 号或每周一」这类表达式现按标准 cron 语义解释，而非等到两条件同时满足。
 
+### Changed
+- Windows 上 `exec`/`process` 工具的执行 shell 从 `cmd.exe /C` 切换为 Git Bash（`bash -c`），模型可用 POSIX 语法，消除 cmd 语法代差导致的脚本不可靠。
+
 ---
 
 ## [0.2.2] - 2026-09-10

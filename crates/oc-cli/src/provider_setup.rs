@@ -15,6 +15,7 @@ use oc_server::tools_bridge::ToolExecutor;
 use oc_server::SessionConfig;
 use oc_tools::exec::ExecTool;
 use oc_tools::file::FileTool;
+use oc_tools::shell::Shell;
 use oc_tools::sys::SysTool;
 use oc_tools::ToolRegistry;
 
@@ -119,6 +120,9 @@ fn build_tools(cfg: &Config) -> Result<ToolExecutor> {
     let exec_timeout = Duration::from_secs(cfg.tools.exec_timeout_secs);
     let approval_timeout = Duration::from_secs(cfg.tools.approval.timeout_secs);
 
+    // Windows 上执行 shell 用 Git Bash；探测失败即启动失败（硬依赖，不回退 cmd）。
+    let shell = Shell::resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // file/sys 允许根：`~/.oc/workspace` + OC_HOME。
     //
     // 曾经第一项是 `std::env::current_dir()`，于是允许根等于 daemon 的启动目录：
@@ -137,7 +141,7 @@ fn build_tools(cfg: &Config) -> Result<ToolExecutor> {
     }
 
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(ExecTool::new(mode, exec_timeout, approval_timeout)));
+    registry.register(Arc::new(ExecTool::new(mode, exec_timeout, approval_timeout, shell.clone())));
     registry.register(Arc::new(FileTool::new(roots.clone())));
     // sys：pwd/cd/now（cd 受同一组 allowed_roots 约束）。
     // 传本机时区：now 要与系统提示词的「当前时间」同口径，否则模型拿两个格式对账。
@@ -145,7 +149,7 @@ fn build_tools(cfg: &Config) -> Result<ToolExecutor> {
 
     // process 工具：后台移交 channel，接口另一端在 serve_with 接到台账。
     let (handoff_tx, handoff_rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.register(Arc::new(oc_tools::process::ProcessTool::new(handoff_tx)));
+    registry.register(Arc::new(oc_tools::process::ProcessTool::new(handoff_tx, shell)));
 
     // message：主动通知用户（不等回复）。
     registry.register(Arc::new(oc_tools::message::MessageTool));
