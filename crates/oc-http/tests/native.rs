@@ -407,6 +407,7 @@ async fn history_exposes_tool_call_structure() {
     use oc_server::testing::SessionConfigExt;
     use oc_server::tools_bridge::ToolExecutor;
     use oc_tools::exec::ExecTool;
+    use oc_tools::shell::Shell;
     use oc_tools::ToolRegistry;
 
     let scripts = vec![
@@ -432,6 +433,7 @@ async fn history_exposes_tool_call_structure() {
         ApprovalMode::Allow,
         Duration::from_secs(10),
         Duration::from_secs(30),
+        Shell::resolve().unwrap(),
     )));
 
     let daemon = TestDaemon::builder("nat-toolstruct", Arc::new(SequencedMock::new(scripts)))

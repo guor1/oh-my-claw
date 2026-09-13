@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use oc_core::tool::{approval_decision, classify_command, ApprovalMode, ApprovalOutcome};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use crate::error::{ToolError, ToolResult};
 use crate::sanitize::sanitize;
+use crate::shell::Shell;
 use crate::types::{ApprovalReply, ToolCtx, ToolOutput, ToolPolicy, ToolSpec};
 use crate::Tool;
 
@@ -22,6 +22,8 @@ pub struct ExecTool {
     pub timeout: Duration,
     /// 等待用户审批回执的上限；`ZERO` = 不设上限。超时按拒绝处理。
     pub approval_timeout: Duration,
+    /// 执行 shell（启动时探测，见 `crate::shell`）。
+    pub shell: Shell,
 }
 
 #[derive(Deserialize)]
@@ -31,8 +33,8 @@ struct ExecArgs {
 }
 
 impl ExecTool {
-    pub fn new(mode: ApprovalMode, timeout: Duration, approval_timeout: Duration) -> Self {
-        Self { mode, timeout, approval_timeout }
+    pub fn new(mode: ApprovalMode, timeout: Duration, approval_timeout: Duration, shell: Shell) -> Self {
+        Self { mode, timeout, approval_timeout, shell }
     }
 }
 
@@ -98,7 +100,7 @@ impl Tool for ExecTool {
         cx.update(format!("$ {cmd}\n"));
 
         // 运行（超时 + 取消）。
-        let child_fut = run_command(&cmd, &cx);
+        let child_fut = run_command(&cmd, &cx, &self.shell);
         let output = tokio::select! {
             _ = cx.cancel.cancelled() => return Err(ToolError::Aborted),
             r = tokio::time::timeout(self.timeout, child_fut) => {
@@ -115,11 +117,13 @@ impl Tool for ExecTool {
 
 /// 实际跑命令：跨平台选 shell，收集 stdout+stderr。
 ///
-/// 按**原始字节**读取，再 lossy 解码为 UTF-8——Windows `cmd` 的本地化输出
-/// 常是 GBK(cp936) 而非 UTF-8，若按行做严格 UTF-8 解码会直接 `InvalidData`
-/// 报错（表现为「命令输出有编码问题」）。lossy 让非法字节退化为 `�` 而非崩溃。
-async fn run_command(cmd: &str, cx: &ToolCtx) -> ToolResult<ToolOutput> {
-    let mut command = shell_command(cmd, &cx.cwd);
+/// 按**原始字节**读取，再 lossy 解码为 UTF-8——bash 下模型若调用原生
+/// Windows 命令（`ipconfig` 等）仍可能输出 GBK(cp936) 而非 UTF-8，若按行
+/// 做严格 UTF-8 解码会直接 `InvalidData` 报错（表现为「命令输出有编码问题」）。
+/// lossy 让非法字节退化为 `�` 而非崩溃。
+async fn run_command(cmd: &str, cx: &ToolCtx, shell: &Shell) -> ToolResult<ToolOutput> {
+    let mut command = shell.command(cmd);
+    command.current_dir(&cx.cwd);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = command.spawn()?;
@@ -162,22 +166,4 @@ async fn run_command(cmd: &str, cx: &ToolCtx) -> ToolResult<ToolOutput> {
         background_task: None,
         new_cwd: None,
     })
-}
-
-/// 跨平台 shell 命令构造。子进程工作目录 = 会话 cwd（cd 后 exec 跟随）。
-fn shell_command(cmd: &str, cwd: &std::path::Path) -> Command {
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c.current_dir(cwd);
-        c
-    }
-    #[cfg(not(windows))]
-    {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c.current_dir(cwd);
-        c
-    }
 }

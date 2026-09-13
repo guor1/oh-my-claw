@@ -17,6 +17,7 @@ use oc_server::session;
 use oc_server::testing::{test_cfg, SessionConfigExt};
 use oc_server::tools_bridge::ToolExecutor;
 use oc_tools::exec::ExecTool;
+use oc_tools::shell::Shell;
 use oc_tools::ToolRegistry;
 use tokio::sync::broadcast;
 
@@ -46,6 +47,7 @@ async fn abort_interrupts_pending_approval_and_cleans_registry() {
         ApprovalMode::Prompt,
         Duration::from_secs(30),
         Duration::from_secs(30),
+        Shell::resolve().unwrap(),
     )));
     let registry: oc_server::state::ApprovalRegistry = Arc::new(dashmap::DashMap::new());
     let executor = ToolExecutor::new(Arc::new(reg)).with_approvals(Arc::clone(&registry));

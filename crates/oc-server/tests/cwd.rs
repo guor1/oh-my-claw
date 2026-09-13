@@ -10,6 +10,7 @@ use oc_proto::{Event, RunId, SessionId, ToolCallId};
 use oc_server::sink::RunSink;
 use oc_server::tools_bridge::ToolExecutor;
 use oc_tools::exec::ExecTool;
+use oc_tools::shell::Shell;
 use oc_tools::sys::SysTool;
 use oc_tools::ToolRegistry;
 use tokio::sync::broadcast;
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 fn executor(roots: Vec<std::path::PathBuf>) -> ToolExecutor {
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(ExecTool::new(ApprovalMode::Allow, Duration::from_secs(10), Duration::from_secs(30))));
+    reg.register(Arc::new(ExecTool::new(ApprovalMode::Allow, Duration::from_secs(10), Duration::from_secs(30), Shell::resolve().unwrap())));
     reg.register(Arc::new(SysTool::new(roots, "UTC")));
     ToolExecutor::new(Arc::new(reg))
 }
@@ -132,8 +133,9 @@ async fn exec_follows_cwd() {
     let esc = sub.to_string_lossy().replace('\\', "\\\\");
     call(&ex, "sys", &format!(r#"{{"op":"cd","path":"{esc}"}}"#), &s).await;
 
-    // 跨平台打印当前目录的命令。
-    let cmd = if cfg!(windows) { "cd" } else { "pwd" };
+    // 打印当前目录的命令。exec 统一经 bash 执行后 `pwd` 两平台通用
+    // （旧 Windows 分支用 `cd`：cmd 下打印目录，bash 下却切到 $HOME 且无输出）。
+    let cmd = "pwd";
     let out = call(&ex, "exec", &format!(r#"{{"command":"{cmd}"}}"#), &s).await;
 
     // 输出应包含子目录名（exec 子进程 current_dir 跟随会话 cwd）。

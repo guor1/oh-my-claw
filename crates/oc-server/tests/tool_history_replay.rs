@@ -181,6 +181,7 @@ async fn tool_round_persists_structure_and_survives_restart() {
     use oc_llm::{Delta, FinishReason};
     use oc_server::tools_bridge::ToolExecutor;
     use oc_tools::exec::ExecTool;
+    use oc_tools::shell::Shell;
     use oc_tools::ToolRegistry;
 
     let store = oc_store::Store::open_memory().unwrap();
@@ -191,6 +192,7 @@ async fn tool_round_persists_structure_and_survives_restart() {
         ApprovalMode::Allow,
         Duration::from_secs(10),
         Duration::from_secs(30),
+        Shell::resolve().unwrap(),
     )));
     let tools = ToolExecutor::new(Arc::new(reg));
 

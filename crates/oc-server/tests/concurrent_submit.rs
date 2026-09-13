@@ -20,13 +20,14 @@ use oc_proto::{Event, LifecyclePhase};
 use oc_server::session::{self, SessionConfig};
 use oc_server::tools_bridge::ToolExecutor;
 use oc_tools::exec::ExecTool;
+use oc_tools::shell::Shell;
 use oc_tools::ToolRegistry;
 use tokio::sync::broadcast;
 use oc_server::testing::{test_cfg, SessionConfigExt};
 
 fn tool_executor() -> ToolExecutor {
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(ExecTool::new(ApprovalMode::Allow, Duration::from_secs(10), Duration::from_secs(30))));
+    reg.register(Arc::new(ExecTool::new(ApprovalMode::Allow, Duration::from_secs(10), Duration::from_secs(30), Shell::resolve().unwrap())));
     ToolExecutor::new(Arc::new(reg))
 }
 

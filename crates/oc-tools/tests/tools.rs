@@ -5,6 +5,7 @@ use std::time::Duration;
 use oc_core::tool::ApprovalMode;
 use oc_tools::exec::ExecTool;
 use oc_tools::file::FileTool;
+use oc_tools::shell::Shell;
 use oc_tools::types::{ApprovalGate, ApprovalReply, ToolCtx};
 use oc_tools::Tool;
 use tokio::sync::mpsc;
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn exec_safe_command_runs() {
-    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::from_secs(30));
+    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::from_secs(30), Shell::resolve().unwrap());
     let cx = ToolCtx::detached(CancellationToken::new());
     // echo 在 cmd.exe 与 POSIX sh 下写法一致，无需按平台分支。
     let echo = "echo hello";
@@ -26,7 +27,7 @@ async fn exec_safe_command_runs() {
 
 #[tokio::test]
 async fn exec_dangerous_needs_approval_and_denied() {
-    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::from_secs(30));
+    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::from_secs(30), Shell::resolve().unwrap());
 
     // 建审批门，自动拒绝。
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
@@ -62,6 +63,7 @@ async fn exec_approval_timeout_denies() {
         ApprovalMode::Prompt,
         Duration::from_secs(10),
         Duration::from_secs(120),
+        Shell::resolve().unwrap(),
     );
 
     // 建审批门但**永不回执**——模拟无人值守。
@@ -93,7 +95,7 @@ async fn exec_approval_timeout_denies() {
 /// 这里验证它不会退化成「立即拒绝」——那会让 TUI 下的审批完全不可用。
 #[tokio::test(start_paused = true)]
 async fn exec_approval_zero_timeout_waits_for_reply() {
-    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::ZERO);
+    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::ZERO, Shell::resolve().unwrap());
 
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
     let cx = ToolCtx {
@@ -128,7 +130,7 @@ async fn exec_approval_zero_timeout_waits_for_reply() {
 
 #[tokio::test]
 async fn exec_dangerous_approved_runs() {
-    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::from_secs(30));
+    let tool = ExecTool::new(ApprovalMode::Prompt, Duration::from_secs(10), Duration::from_secs(30), Shell::resolve().unwrap());
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
     let cx = ToolCtx {
         cancel: CancellationToken::new(),
