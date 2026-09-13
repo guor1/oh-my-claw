@@ -4,24 +4,31 @@
 
 ---
 
-## [Unreleased]
+## [0.2.3] - 2026-09-13
 
 ### Added
+- **技能系统（ROAD-1）**：`oc-core::skill`（frontmatter 解析 + sha256 指纹 + 门控），config 加 `[skills]` allowlist/denylist，`skills_loader` 目录式扫描 `~/.oc/skills/*/SKILL.md`（支持 scoped 包、跳过非 UTF-8 目录名）。base prompt 只注入技能索引，正文由模型按需用 `file` 工具读取。
+- **内嵌 Web UI + 原生 API**：原生 REST + SSE 接口，工具调用结构化渲染，assistant 正文支持 Markdown。
+- **斜杠指令下沉 daemon**：`/help`、`/clear`、`/compact`、`/cron` 等由 daemon 统一实现，TUI 与 Web UI 共用，输出改卡片排版。
+- **Windows 执行器切换 Git Bash**：`exec`/`process` 工具从 `cmd.exe /C` 换成 `bash -c`，模型可用 POSIX 语法，消除 cmd 语法代差导致的脚本不可靠；启动时探测 Git Bash，找不到即启动失败（探测区分 WSL shim）。
+- `memory.text` 字段加 FTS5 全文索引，10 万条查询从 243ms 降至 2.7ms（提升约 90 倍）。中文采用 trigram 预切词策略，查询结果与纯 LIKE 完全一致。
+- `oc doctor` 加 `check_shape` 检查：在开发阶段直接改 DDL 不写迁移时，能检出「表结构过旧」并给出删库重建指引。
 - `scripts/test-openai-sdk.py`：真 `openai` Python SDK 指向本网关的 live 探针（TC-H12），验证非流式与 SSE 流式均能被标准客户端解析。
+- 项目更名 memclaw → oh-my-claw。
+
+### Changed
+- 日志分层：`run` 终态日志并入 `tool_rounds`，默认级别只记会话级事件，高精度按需开启。
 
 ### Fixed
 - cron day-of-month / day-of-week 字段都非 `*` 时由 AND 改为 OR（BUG-1）。「每月 1 号或每周一」这类表达式现按标准 cron 语义解释，而非等到两条件同时满足。
-
-### Changed
-- Windows 上 `exec`/`process` 工具的执行 shell 从 `cmd.exe /C` 切换为 Git Bash（`bash -c`），模型可用 POSIX 语法，消除 cmd 语法代差导致的脚本不可靠。
+- `web_search` 从 DuckDuckGo 换成 Bing HTML 端点，修复结果解析失效。
+- 修复 clippy `bind_instead_of_map` 告警（`web.rs` 解析 Bing 结果）。
+- `non_utf8_dir_name_is_skipped` 测试排除 macOS（APFS 强制 UTF-8 文件名，该场景在 macOS 上不成立）。
+- 提示词引导模型按字面写 shell 元字符，避免 `&&` 被输出成 HTML 实体 `&amp;&amp;`。
 
 ---
 
 ## [0.2.2] - 2026-09-10
-
-### Added
-- `memory.text` 字段加 FTS5 全文索引，10 万条查询从 243ms 降至 2.7ms（提升约 90 倍）。中文采用 trigram 预切词策略，查询结果与纯 LIKE 完全一致。
-- `oc doctor` 加 `check_shape` 检查：在开发阶段直接改 DDL 不写迁移时，能检出「表结构过旧」并给出删库重建指引。
 
 ### Fixed
 - macOS Intel CI runner 从已下线的 `macos-13` 换为 `macos-15-intel`，修复 job 永久排队问题。

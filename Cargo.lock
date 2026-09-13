@@ -1227,7 +1227,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "oc-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "oc-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "garde",
  "serde",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "oc-http"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "oc-llm"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "oc-proto"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "schemars",
  "serde",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "oc-server"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "oc-store"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "oc-proto",
  "rusqlite",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "oc-tools"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "glob",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "oc-tui"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "crossterm",
