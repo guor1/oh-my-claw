@@ -236,14 +236,14 @@ fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
         let title_link = chunk
             .split_once("<h2")
             .and_then(|(_, rest)| rest.split_once("href=\""))
-            .and_then(|(_, rest)| {
+            .map(|(_, rest)| {
                 let href = rest.split('"').next().unwrap_or_default();
                 let title = rest
                     .split_once('>')
                     .and_then(|(_, t)| t.split_once("</a>"))
                     .map(|(t, _)| strip_tags(t).trim().to_string())
                     .unwrap_or_default();
-                Some((href.to_string(), title))
+                (href.to_string(), title)
             })
             .filter(|(_, t)| !t.is_empty());
 
