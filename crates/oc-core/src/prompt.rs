@@ -130,10 +130,18 @@ pub fn render_system_prompt(inputs: &PromptInputs) -> RenderedPrompt {
         // learning：上下文里最一致的模式压倒提示词。正常情况下不需要这句，但同一个
         // 模型（豆包）已有无视系统提示词、编造自身型号的前科（见 render_model_line），
         // 它对上下文模式的依赖强于对指令的服从，加一句成本极低。
+        //
+        // 「按字面写元字符」针对真机实测到的抖动：豆包把 `&&` 输出成 HTML 实体
+        // `&amp;&amp;`，bash 报 `syntax error near unexpected token ';&'`（退出码 2）。
+        // 模型自己重试就对了，所以只是多一轮往返，但提示一句成本更低。
+        // **不在 exec 里做反转义**——那会篡改命令语义：处理 HTML 文件或 curl 带
+        // `&amp;` 的 URL 时，用户要的就是字面量。工具层原样传递才是正确行为。
         prefix.push_str(
             "\n优先使用结构化工具完成任务：查看/切换目录用 sys（pwd/cd/now），\
              读写/检索文件用 file（read/write/edit/append/list/stat/head/tail/grep/glob）。\
-             仅当这些工具都覆盖不到时才用 exec 执行 shell 命令。\n\
+             仅当这些工具都覆盖不到时才用 exec 执行 shell 命令。\
+             命令里的 shell 元字符按字面写，不要用 HTML 实体转义\
+             （写 `&&`、`>`、`\"`，不要写 `&amp;&amp;`、`&gt;`、`&quot;`）。\n\
              \n修改已有文件用 file 的 edit（只发要改的那一小段），不要用 write \
              重发整个文件：工具参数是逐字符流式传输的，重发一个几十 KB 的文件要\
              好几分钟，而且长参数容易撞上输出长度上限被截断。\
@@ -222,6 +230,22 @@ mod tests {
         let p2 = render_system_prompt(&inputs("T2", &[], &[]));
         assert_eq!(p1.stable_prefix, p2.stable_prefix, "时间变化不应影响稳定前缀");
         assert_ne!(p1.volatile_suffix, p2.volatile_suffix);
+    }
+
+    /// 真机抖动回归：豆包把 `&&` 写成 HTML 实体 `&amp;&amp;`，bash 报
+    /// `syntax error near unexpected token ';&'`。提示词里必须留着「按字面写元字符」
+    /// 这句——它在工具段内，重排提示词时容易被顺手删掉。
+    #[test]
+    fn shell_metachar_guidance_present() {
+        let tools = vec![ToolBrief { name: "exec".into(), description: "执行命令".into() }];
+        let r = render_system_prompt(&inputs("NOW", &tools, &[]));
+        assert!(
+            r.stable_prefix.contains("不要用 HTML 实体转义"),
+            "工具引导应含「按字面写 shell 元字符」提示: {}",
+            r.stable_prefix
+        );
+        // 这是稳定引导，不该落到易变尾部（否则每轮重发、且无法被缓存）。
+        assert!(!r.volatile_suffix.contains("不要用 HTML 实体转义"));
     }
 
     #[test]
