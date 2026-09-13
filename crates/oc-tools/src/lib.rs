@@ -13,6 +13,7 @@ pub mod path_guard;
 pub mod process;
 pub mod registry;
 pub mod sanitize;
+pub mod shell;
 pub mod sys;
 pub mod types;
 #[cfg(feature = "web")]

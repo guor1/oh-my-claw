@@ -30,3 +30,6 @@ tempfile = "3"
 default = ["web"]
 # web_fetch / web_search 需要 HTTP client。
 web = ["dep:reqwest"]
+
+[target."cfg(windows)".dependencies]
+winreg = "0.52"
