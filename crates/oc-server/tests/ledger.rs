@@ -5,6 +5,7 @@ use std::time::Duration;
 use oc_proto::{Event, TaskState};
 use oc_server::ledger::TaskLedger;
 use oc_tools::process::{BackgroundHandoff, ProcessTool};
+use oc_tools::shell::Shell;
 use oc_tools::types::ToolCtx;
 use oc_tools::Tool;
 use tokio::sync::{broadcast, mpsc};
@@ -17,7 +18,7 @@ async fn process_tool_registers_and_completes() {
 
     // process 工具的移交 channel。
     let (handoff_tx, mut handoff_rx) = mpsc::unbounded_channel::<BackgroundHandoff>();
-    let tool = ProcessTool::new(handoff_tx);
+    let tool = ProcessTool::new(handoff_tx, Shell::resolve().unwrap());
 
     // 台账 pump：收到移交就登记。
     tokio::spawn(async move {

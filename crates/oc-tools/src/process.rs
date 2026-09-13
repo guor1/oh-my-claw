@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{ToolError, ToolResult};
 use crate::types::{ToolCtx, ToolOutput, ToolPolicy, ToolSpec};
+use crate::shell::Shell;
 use crate::Tool;
 
 /// 后台进程移交事件：server 收到后登记到台账并跟踪。
@@ -25,6 +26,8 @@ pub struct BackgroundHandoff {
 /// process 工具。持有向 server 移交后台进程的发送端。
 pub struct ProcessTool {
     handoff: mpsc::UnboundedSender<BackgroundHandoff>,
+    /// 执行 shell（启动时探测，见 `crate::shell`）。
+    shell: Shell,
 }
 
 #[derive(Deserialize)]
@@ -33,8 +36,8 @@ struct ProcArgs {
 }
 
 impl ProcessTool {
-    pub fn new(handoff: mpsc::UnboundedSender<BackgroundHandoff>) -> Self {
-        Self { handoff }
+    pub fn new(handoff: mpsc::UnboundedSender<BackgroundHandoff>, shell: Shell) -> Self {
+        Self { handoff, shell }
     }
 }
 
@@ -74,7 +77,7 @@ impl Tool for ProcessTool {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
         // spawn 后台进程（工作目录 = 会话 cwd），输出打到 out_tx。
-        spawn_background(&cmd, &cx.cwd, out_tx, done_tx)?;
+        spawn_background(&cmd, &cx.cwd, out_tx, done_tx, &self.shell)?;
 
         // 移交给 server 登记台账。
         self.handoff
@@ -95,8 +98,9 @@ fn spawn_background(
     cwd: &std::path::Path,
     out_tx: mpsc::UnboundedSender<String>,
     done_tx: tokio::sync::oneshot::Sender<i32>,
+    shell: &Shell,
 ) -> ToolResult<()> {
-    let mut command = shell_command(cmd);
+    let mut command = shell.command(cmd);
     command.current_dir(cwd);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
@@ -115,19 +119,4 @@ fn spawn_background(
     });
 
     Ok(())
-}
-
-fn shell_command(cmd: &str) -> tokio::process::Command {
-    #[cfg(windows)]
-    {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    }
-    #[cfg(not(windows))]
-    {
-        let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c
-    }
 }
