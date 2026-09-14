@@ -5,6 +5,7 @@
 //! panic 隔离：run 主体用 catch_unwind 包裹（设计 §10.3）。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use oc_core::agent::RunOutcome;
@@ -248,6 +249,9 @@ async fn actor_loop(
     // 且随后的 Finished 会刷新时钟。
     let mut last_activity = tokio::time::Instant::now();
 
+    // 压缩在途守卫：手动 /compact 与每轮结束后的自动压缩共用，防两个摘要并发叠加。
+    let compact_in_flight = Arc::new(AtomicBool::new(false));
+
     // 确保本会话存在。kind 统一记为 "main"（用户会话）；cron/dreaming 等隔离
     // 子会话不经本 actor，细分留待后续。
     if let Err(e) = store
@@ -328,13 +332,14 @@ async fn actor_loop(
                 let tc = std::time::Instant::now();
                 info!(session = %sid, "compact 开始（占用车道）");
                 diag.compact_start();
-                compact_session(&store, &cfg, &provider, &events, &sid).await;
+                compact_session(&store, &cfg, &provider, &events, &sid, &compact_in_flight).await;
                 diag.compact_done();
                 info!(session = %sid, ms = tc.elapsed().as_millis(), "compact 结束");
             }
             SessionCmd::Finished { run_id, outcome } => {
                 last_activity = tokio::time::Instant::now();
                 if active.as_ref().map(|a| &a.run_id) == Some(&run_id) {
+                    let completed = matches!(outcome, RunOutcome::Completed);
                     let elapsed = active.as_ref().map(|a| a.started_at.elapsed().as_millis()).unwrap_or(0);
                     // 日志汇总：抓 diag 在 run_done 清空前留下的工具轮数，跟终态并到
                     // 一条日志里——这样「run 完成」与「run 非正常终态」两条 INFO/WARN
@@ -363,6 +368,18 @@ async fn actor_loop(
                             )
                             .await,
                         );
+                    }
+                    // 每轮结束后自动滚动压缩（后台，不占车道）。仅正常结束且开启
+                    // auto_compact 时触发；水位不足或已有压缩在途时内部自会跳过。
+                    if completed && cfg.auto_compact {
+                        let store_c = store.clone();
+                        let cfg_c = cfg.clone();
+                        let provider_c = Arc::clone(&provider);
+                        let sid_c = sid.clone();
+                        let guard_c = Arc::clone(&compact_in_flight);
+                        tokio::spawn(async move {
+                            maybe_auto_compact(&store_c, &cfg_c, &provider_c, &sid_c, &guard_c).await;
+                        });
                     }
                 }
             }
@@ -790,8 +807,16 @@ async fn compact_session(
     provider: &Arc<dyn Provider>,
     events: &broadcast::Sender<Event>,
     session_id: &str,
+    guard: &Arc<AtomicBool>,
 ) {
-    match compact_core(store, cfg, provider, session_id).await {
+    // 抢在途守卫：自动压缩可能在后台跑。抢不到说明已有压缩进行中，提示而非叠加。
+    if guard.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        notify_compact(events, session_id, "正在压缩中，请稍后再试");
+        return;
+    }
+    let outcome = compact_core(store, cfg, provider, session_id).await;
+    guard.store(false, Ordering::Release);
+    match outcome {
         CompactOutcome::Summarized { older_count } => notify_compact(
             events,
             session_id,
@@ -806,6 +831,41 @@ async fn compact_session(
             notify_compact(events, session_id, &format!("压缩失败：{step}"));
         }
     }
+}
+
+/// 每轮结束后的自动滚动摘要压缩：水位不足或已有压缩在途则跳过（静默）。
+async fn maybe_auto_compact(
+    store: &oc_store::Store,
+    cfg: &SessionConfig,
+    provider: &Arc<dyn Provider>,
+    session_id: &str,
+    guard: &Arc<AtomicBool>,
+) {
+    // 水位判定：transcript 总 token 估算 ≤ 预算 × 0.8 则不压。
+    let entries = match store
+        .writer()
+        .load_transcript(session_id.into(), cfg.max_history_entries)
+        .await
+    {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "auto compact：加载历史失败，跳过");
+            return;
+        }
+    };
+    let total: i64 = entries.iter().map(|e| e.tokens_est.max(1)).sum();
+    if total <= cfg.history_token_budget * 4 / 5 {
+        return;
+    }
+
+    // 抢在途守卫：与手动 /compact 互斥。抢不到说明已有压缩进行中，直接返回。
+    if guard.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    let outcome = compact_core(store, cfg, provider, session_id).await;
+    guard.store(false, Ordering::Release);
+    // 自动压缩静默：只打日志，不向用户弹通知（每 ~16K 对话弹一次会骚扰）。
+    info!(session = %session_id, ?outcome, "auto compact 完成");
 }
 
 /// 把一段会话历史沉淀为 episodic 记忆候选（设计 §11.5，P1-6）。
