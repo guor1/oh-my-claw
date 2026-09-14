@@ -106,8 +106,10 @@ async fn auto_compact_skips_short_history() {
     // 给足时间让「若有误触发的压缩」跑出来，再断言没有。
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let reqs = captures.lock().unwrap();
-    assert_eq!(reqs.len(), 1, "短历史不应触发摘要模型调用（captures 应只有主 run 一次）");
+    // 锁只在取值时持有：guard 跨 `.await` 会被 clippy::await_holding_lock 拦下
+    // （CI 跑 `-D warnings`，那是 fatal），且真跨 await 持锁本身就有死锁风险。
+    let req_count = captures.lock().unwrap().len();
+    assert_eq!(req_count, 1, "短历史不应触发摘要模型调用（captures 应只有主 run 一次）");
     let hist = w.load_transcript("main".into(), 500).await.unwrap();
     assert!(!hist.iter().any(|e| e.content.contains("上下文摘要")), "短历史不应产生摘要 entry");
 }
