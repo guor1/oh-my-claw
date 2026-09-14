@@ -61,7 +61,11 @@ async fn auto_compact_triggers_on_long_history() {
         let hist = w.load_transcript("main".into(), 500).await.unwrap();
         if hist.iter().any(|e| e.content.contains("上下文摘要")) {
             assert!(hist.iter().any(|e| e.content.contains("这是压缩后的摘要文本")), "应含摘要文本");
-            assert!(!hist.iter().any(|e| e.content.contains("历史消息 0")), "最早消息应被排除");
+            assert!(
+                !hist.iter().any(|e| e.content.contains(&format!("{big}#0"))),
+                "最早消息应被排除"
+            );
+            assert!(hist.iter().any(|e| e.content.contains("最新一句")), "最近消息应保留");
             ok = true;
             break;
         }
