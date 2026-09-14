@@ -9,7 +9,7 @@ use crate::error::{StoreError, StoreResult};
 use crate::schema;
 
 /// 当前目标 schema 版本。新增迁移时 +1 并在 [`step`] 中追加分支。
-pub const TARGET_VERSION: u32 = 2;
+pub const TARGET_VERSION: u32 = 3;
 
 /// 从当前 `user_version` 前向迁移到 [`TARGET_VERSION`]。
 pub fn run_migrations(conn: &mut Connection) -> StoreResult<()> {
@@ -49,6 +49,11 @@ fn step(conn: &Connection, version: u32) -> StoreResult<()> {
         // P1-3：memory 加 pref_key（偏好主题），供 supersede 查同主题既有项。
         2 => {
             conn.execute_batch(schema::V2)?;
+            Ok(())
+        }
+        // FEAT-3：memory 加 source（来源追溯）。
+        3 => {
+            conn.execute_batch(schema::V3)?;
             Ok(())
         }
         other => Err(StoreError::Migration(format!(
@@ -121,5 +126,48 @@ mod tests {
             .expect("v1 时期的行升级后必须还在");
         assert_eq!(text, "我用 VS Code", "既有内容不得被迁移改动");
         assert_eq!(pref, None, "新列对既有行应为 NULL（非偏好类，走原去重路径）");
+    }
+
+    /// v2 老库升到 v3：既有数据完好，source 新列为 NULL。
+    #[test]
+    fn migration_v2_to_v3_preserves_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // 造一个到 v2 的库。
+        {
+            let tx = conn.transaction().unwrap();
+            step(&tx, 1).unwrap();
+            tx.pragma_update(None, "user_version", 1i64).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = conn.transaction().unwrap();
+            step(&tx, 2).unwrap();
+            tx.pragma_update(None, "user_version", 2i64).unwrap();
+            tx.commit().unwrap();
+        }
+        // v2 时期写入的一条记忆（那时还没有 source 列）。
+        conn.execute(
+            "INSERT INTO memory(id, tier, origin, text, importance, created_at, content_hash)
+             VALUES('old-2', 'episodic', 'agent', '关于某次调试的情节', 0.6, 2000, 'h2')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&mut conn).unwrap();
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v as u32, TARGET_VERSION, "应升到目标版本");
+
+        let (text, source): (String, Option<String>) = conn
+            .query_row(
+                "SELECT text, source FROM memory WHERE id = 'old-2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("v2 时期的行升级后必须还在");
+        assert_eq!(text, "关于某次调试的情节", "既有内容不得被迁移改动");
+        assert_eq!(source, None, "source 新列对既有行应为 NULL");
     }
 }

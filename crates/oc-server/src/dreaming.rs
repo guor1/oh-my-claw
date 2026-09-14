@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use oc_core::dreaming::{
-    build_consolidation_prompt, decide_write, dreaming_gate, DreamCandidate, DreamCfg, WritePlan,
-    CONSOLIDATION_SYSTEM_PROMPT,
+    build_consolidate_decision_prompt, build_consolidation_prompt, decide_write, dreaming_gate,
+    parse_consolidations, ConsolidateAction, DreamCandidate, DreamCfg, WritePlan,
+    CONSOLIDATE_JSON_SYSTEM_PROMPT, CONSOLIDATION_SYSTEM_PROMPT,
 };
 use oc_core::memory::{Origin as CoreOrigin, Tier as CoreTier};
 use oc_llm::{Delta, Message, ModelRequest, MsgRole, Provider};
@@ -41,7 +42,12 @@ pub async fn scan(store: &oc_store::Store, now_secs: i64, cfg: &DreamCfg) -> usi
     scan_with(store, now_secs, cfg, None).await
 }
 
-/// 执行一轮 dreaming 巩固扫描，`ctx` 非空时追加**巩固模型轮**重写 MEMORY.md（§11.4）。
+/// 执行一轮 dreaming 巩固扫描，`ctx` 非空时追加**巩固模型轮**（§11.4）。
+///
+/// FEAT-4：巩固模型轮不再自由重写，而是对每条双门通过的新候选输出结构化动作
+/// （CREATE/CORROBORATE/REFINE/CORRECT），逐条落库 + 审计，再用各动作产出的
+/// `merged_text` 拼成 MEMORY.md。模型调用失败 / 输出无法解析时回落到「全部
+/// CREATE」（就地 promote，等价旧行为），能力不因解析失败而丢。
 pub async fn scan_with(
     store: &oc_store::Store,
     now_secs: i64,
@@ -87,106 +93,139 @@ pub async fn scan_with(
         return 0;
     }
 
-    // 通过双门 → 就地巩固 + 审计。逐条容错。
-    let mut promoted = 0usize;
-    for c in &consolidations {
-        if let Err(e) = store.writer().promote_memory(c.id.clone()).await {
-            warn!(id = %c.id, error = %e, "dreaming：巩固失败");
+    // id → 原文，供动作执行与 MEMORY.md 重写用。
+    let passed: Vec<(String, String)> = consolidations
+        .iter()
+        .filter_map(|c| rows.iter().find(|r| r.id == c.id))
+        .map(|r| (r.id.clone(), r.text.clone()))
+        .collect();
+
+    // 既有 curated（id + text），供模型判断「新候选落到哪条旧条目」。
+    let curated = match store.curated_list().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "dreaming：取既有 curated 失败，回退全部 CREATE");
+            Vec::new()
+        }
+    };
+
+    // 巩固模型轮：让模型对每条新候选输出结构化动作。无 ctx / 调用失败 / 解析失败
+    // 都回落到「全部 CREATE」（就地 promote，等价旧行为）。
+    let items = match ctx {
+        Some(c) => {
+            let prompt = build_consolidate_decision_prompt(&curated, &passed);
+            match run_model_json(c, &prompt).await.and_then(|raw| parse_consolidations(&raw)) {
+                Some(items) => items,
+                None => {
+                    warn!("dreaming：巩固模型轮无输出或解析失败，回退全部 CREATE");
+                    passed
+                        .iter()
+                        .map(|(id, text)| oc_core::dreaming::ConsolidateItem {
+                            source_id: id.clone(),
+                            action: ConsolidateAction::Create,
+                            target_id: None,
+                            merged_text: text.clone(),
+                        })
+                        .collect()
+                }
+            }
+        }
+        None => passed
+            .iter()
+            .map(|(id, text)| oc_core::dreaming::ConsolidateItem {
+                source_id: id.clone(),
+                action: ConsolidateAction::Create,
+                target_id: None,
+                merged_text: text.clone(),
+            })
+            .collect(),
+    };
+
+    // 逐条执行动作 + 审计。容错：单条失败不拖垮整轮。
+    let mut merged_texts: Vec<String> = Vec::new();
+    for item in &items {
+        // 源 id 必须是本轮通过双门的候选之一（防模型编造出库里不存在的 id）。
+        if !passed.iter().any(|(id, _)| id == &item.source_id) {
+            warn!(source = %item.source_id, "dreaming：模型输出了未知 source_id，跳过");
             continue;
         }
+        let action = item.action;
+        let merged_hash = content_hash(&item.merged_text);
+        match action {
+            ConsolidateAction::Create => {
+                match store.writer().promote_memory(item.source_id.clone()).await {
+                    Ok(()) => merged_texts.push(item.merged_text.clone()),
+                    Err(e) => {
+                        warn!(id = %item.source_id, error = %e, "dreaming：create 巩固失败");
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                // 非 create：target_id 必须存在；否则退化为 create。
+                match &item.target_id {
+                    Some(t) if curated.iter().any(|(id, _)| id == t) => {
+                        match store
+                            .writer()
+                            .merge_memory(
+                                item.source_id.clone(),
+                                t.clone(),
+                                item.merged_text.clone(),
+                                merged_hash.clone(),
+                            )
+                            .await
+                        {
+                            Ok(()) => merged_texts.push(item.merged_text.clone()),
+                            Err(e) => {
+                                warn!(source = %item.source_id, target = %t, error = %e, "dreaming：合并失败");
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        // 无合法落点 → 退化为 create。
+                        match store.writer().promote_memory(item.source_id.clone()).await {
+                            Ok(()) => merged_texts.push(item.merged_text.clone()),
+                            Err(e) => {
+                                warn!(id = %item.source_id, error = %e, "dreaming：回退 create 失败");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let audit_action = format!("consolidate:{}", action.as_str());
         if let Err(e) = store
             .writer()
-            .write_audit(
-                "dreaming".into(),
-                "consolidate".into(),
-                Some(c.id.clone()),
-            )
+            .write_audit("dreaming".into(), audit_action, Some(item.source_id.clone()))
             .await
         {
-            warn!(id = %c.id, error = %e, "dreaming：审计写入失败");
+            warn!(id = %item.source_id, error = %e, "dreaming：审计写入失败");
         }
-        promoted += 1;
-    }
-    if promoted > 0 {
-        info!(promoted, "dreaming：本轮巩固完成");
     }
 
-    // 巩固模型轮：把本轮巩固的条目并进 MEMORY.md（§11.4）。
-    // 失败只告警——DB 内的 tier 提升已经成功，文件写不成不该让整轮算失败。
+    let promoted = merged_texts.len();
     if promoted > 0 {
+        info!(promoted, "dreaming：本轮巩固完成");
+        // 用各动作产出的合并正文重写 MEMORY.md（§11.4）。
         if let Some(ctx) = ctx {
-            let texts: Vec<String> = consolidations
-                .iter()
-                .filter_map(|c| rows.iter().find(|r| r.id == c.id))
-                .map(|r| r.text.clone())
-                .collect();
-            rewrite_memory_md(ctx, store, &texts).await;
+            rewrite_memory_md(ctx, store, &merged_texts).await;
         }
     }
     promoted
 }
 
-/// 巩固模型轮 + 乐观并发写 MEMORY.md（设计 §11.4）。
-///
-/// 流程：读文件算 hash → 模型重写 → **再读一次**算 hash → `core::decide_write` 判定
-/// → 未变则原子 rename 覆盖；变了则退化 append-only（不吞掉用户/他人的改动）。
-async fn rewrite_memory_md(ctx: &ConsolidateCtx, store: &oc_store::Store, items: &[String]) {
-    if items.is_empty() {
-        return;
-    }
-    let path = ctx.soul_dir.join("MEMORY.md");
-
-    // 生成前读一次：既作为模型输入（要合并而非丢弃旧内容），也作为并发基线。
-    let before = read_or_empty(&path);
-    let hash_before = content_hash(&before);
-
-    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-    let prompt = build_consolidation_prompt(&before, &refs);
-    let Some(new_body) = run_model(ctx, &prompt).await else {
-        warn!("dreaming：巩固模型轮无输出，MEMORY.md 保持不变");
-        return;
-    };
-
-    // 落盘前再读一次，比对哈希判有无并发修改。
-    let hash_now = content_hash(&read_or_empty(&path));
-    let plan = decide_write(&hash_before, &hash_now);
-
-    let result = match plan {
-        WritePlan::Overwrite => {
-            debug!("dreaming：MEMORY.md 未被并发修改，整体重写");
-            atomic_write(&path, &ensure_trailing_newline(&new_body))
-        }
-        WritePlan::AppendOnly => {
-            // 期间有人改过：覆盖会丢掉对方的修改，改为追加。
-            warn!("dreaming：MEMORY.md 期间被修改，退化为追加（不覆盖）");
-            append_section(&path, &new_body)
-        }
-    };
-
-    match result {
-        Ok(()) => {
-            let action = match plan {
-                WritePlan::Overwrite => "rewrite_memory_md",
-                WritePlan::AppendOnly => "append_memory_md",
-            };
-            info!(?plan, items = items.len(), "dreaming：MEMORY.md 已更新");
-            if let Err(e) = store
-                .writer()
-                .write_audit("dreaming".into(), action.into(), None)
-                .await
-            {
-                warn!(error = %e, "dreaming：MEMORY.md 写入审计失败");
-            }
-        }
-        Err(e) => warn!(error = %e, path = %path.display(), "dreaming：MEMORY.md 写入失败"),
-    }
+/// 跑一轮巩固模型调用，返回结构化 JSON 文本（FEAT-4）。超时/失败/空返回 None。
+async fn run_model_json(ctx: &ConsolidateCtx, prompt: &str) -> Option<String> {
+    run_model_with_system(ctx, CONSOLIDATE_JSON_SYSTEM_PROMPT, prompt).await
 }
 
-/// 跑一轮巩固模型调用，累积文本。超时/失败/空返回 None。
-async fn run_model(ctx: &ConsolidateCtx, prompt: &str) -> Option<String> {
+/// 跑一轮巩固模型调用，指定系统提示词。超时/失败/空返回 None。
+async fn run_model_with_system(ctx: &ConsolidateCtx, system: &str, prompt: &str) -> Option<String> {
     let req = ModelRequest {
         model: ctx.model.clone(),
-        system: Some(CONSOLIDATION_SYSTEM_PROMPT.to_string()),
+        system: Some(system.to_string()),
         messages: vec![Message {
             role: MsgRole::User,
             content: prompt.to_string(),
@@ -233,6 +272,62 @@ async fn run_model(ctx: &ConsolidateCtx, prompt: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// 巩固模型轮 + 乐观并发写 MEMORY.md（设计 §11.4）。
+///
+/// 流程：读文件算 hash → 模型重写 → **再读一次**算 hash → `core::decide_write` 判定
+/// → 未变则原子 rename 覆盖；变了则退化 append-only（不吞掉用户/他人的改动）。
+async fn rewrite_memory_md(ctx: &ConsolidateCtx, store: &oc_store::Store, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    let path = ctx.soul_dir.join("MEMORY.md");
+
+    // 生成前读一次：既作为模型输入（要合并而非丢弃旧内容），也作为并发基线。
+    let before = read_or_empty(&path);
+    let hash_before = content_hash(&before);
+
+    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+    let prompt = build_consolidation_prompt(&before, &refs);
+    let Some(new_body) = run_model_with_system(ctx, CONSOLIDATION_SYSTEM_PROMPT, &prompt).await else {
+        warn!("dreaming：巩固模型轮无输出，MEMORY.md 保持不变");
+        return;
+    };
+
+    // 落盘前再读一次，比对哈希判有无并发修改。
+    let hash_now = content_hash(&read_or_empty(&path));
+    let plan = decide_write(&hash_before, &hash_now);
+
+    let result = match plan {
+        WritePlan::Overwrite => {
+            debug!("dreaming：MEMORY.md 未被并发修改，整体重写");
+            atomic_write(&path, &ensure_trailing_newline(&new_body))
+        }
+        WritePlan::AppendOnly => {
+            // 期间有人改过：覆盖会丢掉对方的修改，改为追加。
+            warn!("dreaming：MEMORY.md 期间被修改，退化为追加（不覆盖）");
+            append_section(&path, &new_body)
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            let action = match plan {
+                WritePlan::Overwrite => "rewrite_memory_md",
+                WritePlan::AppendOnly => "append_memory_md",
+            };
+            info!(?plan, items = items.len(), "dreaming：MEMORY.md 已更新");
+            if let Err(e) = store
+                .writer()
+                .write_audit("dreaming".into(), action.into(), None)
+                .await
+            {
+                warn!(error = %e, "dreaming：MEMORY.md 写入审计失败");
+            }
+        }
+        Err(e) => warn!(error = %e, path = %path.display(), "dreaming：MEMORY.md 写入失败"),
     }
 }
 

@@ -127,6 +127,11 @@ impl Store {
         pool: |c| ops::memory_by_pref_key(c, &key)
     );
     read_call!(
+        /// 全部 curated 记忆（id + text），供巩固模型轮判断动作落点（FEAT-4）。
+        curated_list() -> Vec<(String, String)>,
+        pool: |c| ops::curated_list(c)
+    );
+    read_call!(
         /// 全部会话（`oc sessions`）。
         session_list() -> Vec<types::SessionRow>,
         pool: |c| ops::session_list(c)
@@ -424,6 +429,7 @@ mod tests {
             importance: 0.8,
             content_hash: "h1".into(),
             pref_key: None,
+            source: Some("sess-test".into()),
         })
         .await
         .unwrap();
@@ -435,6 +441,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "m1");
         assert_eq!(hits[0].origin, Origin::Owner);
+        assert_eq!(hits[0].source.as_deref(), Some("sess-test"), "source 应往返");
 
         // 不匹配的词返回空。
         let none = w.search_candidates(vec!["登山".into()], None, 10).await.unwrap();
@@ -456,6 +463,7 @@ mod tests {
             importance: 0.8,
             content_hash: format!("h-{id}"),
             pref_key: key.map(|k| k.to_string()),
+            source: None,
         };
 
         w.upsert_memory(mk("p1", "我用 VS Code", Some("编辑器"))).await.unwrap();
@@ -493,6 +501,7 @@ mod tests {
             importance: 0.5,
             content_hash: "hd".into(),
             pref_key: Some("编辑器".into()),
+            source: None,
         })
         .await
         .unwrap();
@@ -518,6 +527,7 @@ mod tests {
             importance: 0.7,
             content_hash: "h1".into(),
             pref_key: None,
+            source: Some("sess-e1".into()),
         })
         .await
         .unwrap();
@@ -545,6 +555,89 @@ mod tests {
             .await
             .unwrap();
         // 无直接读 API，此处只验证不报错即通过（链完整性属实现内不变量）。
+    }
+
+    /// FEAT-4：merge_memory 把 episodic 源并入 curated 目标，源行删除、目标正文/哈希更新。
+    #[tokio::test]
+    async fn merge_memory_merges_source_into_target() {
+        use crate::types::{NewMemory, Origin, Tier};
+        let store = Store::open_memory().expect("open");
+        let w = store.writer();
+
+        // 旧 curated 目标。
+        w.upsert_memory(NewMemory {
+            id: "cur-1".into(),
+            tier: Tier::Curated,
+            origin: Origin::Owner,
+            text: "用户用 VS Code".into(),
+            keywords: None,
+            importance: 0.6,
+            content_hash: "h-c1".into(),
+            pref_key: Some("编辑器".into()),
+            source: Some("sess-old".into()),
+        })
+        .await
+        .unwrap();
+        // 新 episodic 源（同一主题的更新）。
+        w.upsert_memory(NewMemory {
+            id: "ep-1".into(),
+            tier: Tier::Episodic,
+            origin: Origin::Agent,
+            text: "用户改用 Neovim".into(),
+            keywords: None,
+            importance: 0.7,
+            content_hash: "h-e1".into(),
+            pref_key: None,
+            source: Some("sess-new".into()),
+        })
+        .await
+        .unwrap();
+
+        // 合并：源并入目标。
+        w.merge_memory("ep-1".into(), "cur-1".into(), "用户改用 Neovim".into(), "h-merged".into())
+            .await
+            .unwrap();
+
+        // 目标正文/哈希已更新，importance 抬到下限 0.6 之上（不降）。
+        let curated = w
+            .search_candidates(vec!["Neovim".into()], Some(Tier::Curated), 10)
+            .await
+            .unwrap();
+        assert_eq!(curated.len(), 1, "合并后目标应仍可被检索到");
+        assert_eq!(curated[0].id, "cur-1", "目标 id 不变");
+        assert_eq!(curated[0].text, "用户改用 Neovim", "目标正文应被替换为合并文本");
+        assert_eq!(curated[0].content_hash, "h-merged");
+
+        // 源行已删。
+        assert!(w.dream_candidates(10).await.unwrap().is_empty(), "源 episodic 应已删除");
+    }
+
+    #[tokio::test]
+    async fn merge_memory_no_target_leaves_source_untouched() {
+        use crate::types::{NewMemory, Origin, Tier};
+        let store = Store::open_memory().expect("open");
+        let w = store.writer();
+
+        w.upsert_memory(NewMemory {
+            id: "ep-1".into(),
+            tier: Tier::Episodic,
+            origin: Origin::Agent,
+            text: "某条候选".into(),
+            keywords: None,
+            importance: 0.7,
+            content_hash: "h-e1".into(),
+            pref_key: None,
+            source: None,
+        })
+        .await
+        .unwrap();
+
+        // 目标不存在 → merge 无落点，安全放弃（源行保留）。
+        w.merge_memory("ep-1".into(), "nope".into(), "合并文本".into(), "h-x".into())
+            .await
+            .unwrap();
+
+        assert_eq!(w.dream_candidates(10).await.unwrap().len(), 1, "目标不存在时源行应保留");
     }
 
     #[tokio::test]

@@ -79,6 +79,7 @@ async fn dreaming_consolidates_qualified_and_rejects_untrusted() {
         importance: 0.8,
         content_hash: "h1".into(),
         pref_key: None,
+        source: Some("sess-good".into()),
     })
     .await
     .unwrap();
@@ -97,6 +98,7 @@ async fn dreaming_consolidates_qualified_and_rejects_untrusted() {
         importance: 0.9,
         content_hash: "h2".into(),
         pref_key: None,
+        source: Some("sess-bad".into()),
     })
     .await
     .unwrap();

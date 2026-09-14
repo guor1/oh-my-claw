@@ -16,11 +16,17 @@ use oc_server::dreaming::{scan_with, ConsolidateCtx};
 ///
 /// 真实场景是用户在 dreaming 跑模型的这段时间里手编了 MEMORY.md。mock 没有
 /// 副作用钩子，故在此本地实现 Provider：stream_chat 被调用时先写文件再回内容。
+///
+/// FEAT-4 起巩固有两轮模型调用（第 1 轮结构化决策、第 2 轮 MEMORY.md 重写），
+/// 竞态要发生在**重写轮**（第 2 轮），故带 `race_on_call` 指定第几次调用才写文件。
 struct RacingProvider {
     reply: String,
     /// 生成时写入此路径，模拟并发修改。
     race_path: PathBuf,
     race_body: String,
+    /// 第几次 `stream_chat` 调用时改写文件（1-based）。
+    race_on_call: usize,
+    call_count: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -35,8 +41,11 @@ impl oc_llm::Provider for RacingProvider {
         _cancel: tokio_util::sync::CancellationToken,
     ) -> oc_llm::LlmResult<futures_util::stream::BoxStream<'static, oc_llm::LlmResult<oc_llm::Delta>>>
     {
-        // 关键：在返回内容之前改文件，让落盘前的 hash 重校验必然不一致。
-        std::fs::write(&self.race_path, &self.race_body).unwrap();
+        // 只在指定的那一轮改文件，让落盘前的 hash 重校验必然不一致。
+        let n = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if n == self.race_on_call {
+            std::fs::write(&self.race_path, &self.race_body).unwrap();
+        }
         let text = self.reply.clone();
         Ok(Box::pin(futures_util::stream::iter(vec![Ok(oc_llm::Delta::Text(text))])))
     }
@@ -59,6 +68,7 @@ async fn seed_candidate(store: &oc_store::Store, id: &str, text: &str) {
         importance: 0.8,
         content_hash: format!("h-{id}"),
         pref_key: None,
+        source: Some(format!("sess-{id}")),
     })
     .await
     .unwrap();
@@ -108,7 +118,9 @@ async fn existing_content_and_new_items_reach_the_model() {
     seed_candidate(&store, "ep-1", "用户常在周五做复盘").await;
 
     // CapturingMock 记录收到的 ModelRequest，可断言 prompt 真的带上了两边内容。
-    let provider = Arc::new(oc_llm::mock::CapturingMock::new("## 合并\n- 早上喝咖啡\n- 周五复盘"));
+    let provider = Arc::new(oc_llm::mock::CapturingMock::new(
+        "{\"actions\":[{\"source_id\":\"ep-1\",\"action\":\"create\",\"target_id\":null,\"merged_text\":\"## 合并\\n- 早上喝咖啡\\n- 周五复盘\"}]}",
+    ));
     let captures = provider.captures();
     let c = ConsolidateCtx {
         provider: provider.clone(),
@@ -118,13 +130,18 @@ async fn existing_content_and_new_items_reach_the_model() {
     scan_with(&store, 0, &loose_cfg(), Some(&c)).await;
 
     let reqs = captures.lock().unwrap();
-    assert_eq!(reqs.len(), 1, "应只跑一轮巩固模型");
-    let prompt = &reqs[0].messages[0].content;
-    assert!(prompt.contains("早上喝咖啡"), "既有内容必须进 prompt: {prompt}");
-    assert!(prompt.contains("周五做复盘"), "新巩固条目必须进 prompt: {prompt}");
-    // 系统提示词应带防编造约束。
-    let sys = reqs[0].system.as_deref().unwrap_or("");
-    assert!(sys.contains("不要"), "系统提示应含禁止编造的约束: {sys}");
+    assert_eq!(reqs.len(), 2, "应跑两轮：结构化决策 + MEMORY.md 重写");
+    // 第 1 轮：结构化决策 prompt 应带两边内容。
+    let decision = &reqs[0].messages[0].content;
+    assert!(decision.contains("[ep-1]"), "决策 prompt 应带新候选 id: {decision}");
+    assert!(decision.contains("周五做复盘"), "决策 prompt 应带新候选正文: {decision}");
+    // 第 2 轮：MEMORY.md 重写 prompt 应带既有内容与新 merged_text。
+    let rewrite = &reqs[1].messages[0].content;
+    assert!(rewrite.contains("早上喝咖啡"), "重写 prompt 应含既有内容: {rewrite}");
+    assert!(rewrite.contains("周五复盘"), "重写 prompt 应含合并正文: {rewrite}");
+    // 重写轮系统提示词应带防编造约束。
+    let sys = reqs[1].system.as_deref().unwrap_or("");
+    assert!(sys.contains("不要"), "重写系统提示应含禁止编造的约束: {sys}");
 }
 
 /// 乐观并发：生成期间文件被改 → **不得覆盖**，退化为追加。
@@ -137,12 +154,14 @@ async fn concurrent_modification_falls_back_to_append() {
     let store = oc_store::Store::open_memory().unwrap();
     seed_candidate(&store, "ep-1", "用户常在周五做复盘").await;
 
-    // RacingProvider 在生成时写文件，模拟用户在 dreaming 跑模型期间手编 MEMORY.md。
+    // RacingProvider 在重写轮（第 2 轮）生成时写文件，模拟用户在 dreaming 跑模型期间手编 MEMORY.md。
     let c = ConsolidateCtx {
         provider: Arc::new(RacingProvider {
-            reply: "## 新内容\n- 条目".into(),
+            reply: "{\"actions\":[{\"source_id\":\"ep-1\",\"action\":\"create\",\"target_id\":null,\"merged_text\":\"## 新内容\\n- 条目\"}]}".into(),
             race_path: path.clone(),
             race_body: "用户手改的内容\n".into(),
+            race_on_call: 2,
+            call_count: std::sync::atomic::AtomicUsize::new(0),
         }),
         model: "mock".into(),
         soul_dir: tmp.path().to_path_buf(),
@@ -234,6 +253,7 @@ async fn no_candidates_skips_model_round() {
             importance: 0.9,
             content_hash: "hb".into(),
             pref_key: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -246,4 +266,70 @@ async fn no_candidates_skips_model_round() {
         "原样\n",
         "无巩固时不应触发模型轮写文件"
     );
+}
+
+/// FEAT-4：模型输出 corroborate/refine/correct 时，新 episodic 并入旧 curated（不新建）。
+#[tokio::test]
+async fn non_create_action_merges_into_existing_curated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = oc_store::Store::open_memory().unwrap();
+
+    // 旧 curated（偏好）。
+    store
+        .writer()
+        .upsert_memory(oc_store::NewMemory {
+            id: "cur-1".into(),
+            tier: oc_store::Tier::Curated,
+            origin: oc_store::Origin::Owner,
+            text: "用户用 VS Code".into(),
+            keywords: None,
+            importance: 0.6,
+            content_hash: "h-c1".into(),
+            pref_key: Some("编辑器".into()),
+            source: Some("sess-old".into()),
+        })
+        .await
+        .unwrap();
+    // 新 episodic 候选（同主题更新）。
+    seed_candidate(&store, "ep-1", "用户改用 Neovim").await;
+
+    // 模型判定：refine 到 cur-1，合并文本。
+    let provider = Arc::new(oc_llm::mock::CapturingMock::new(
+        "{\"actions\":[{\"source_id\":\"ep-1\",\"action\":\"refine\",\"target_id\":\"cur-1\",\"merged_text\":\"用户改用 Neovim\"}]}",
+    ));
+    let c = ConsolidateCtx {
+        provider: provider.clone(),
+        model: "mock".into(),
+        soul_dir: tmp.path().to_path_buf(),
+    };
+    let promoted = scan_with(&store, 0, &loose_cfg(), Some(&c)).await;
+    assert_eq!(promoted, 1, "refine 应算一次巩固");
+
+    // 结果：cur-1 正文被更新，ep-1 源行删除（不新建第三条 curated）。
+    let curated = store.curated_list().await.unwrap();
+    assert_eq!(curated.len(), 1, "不应新建 curated，只应并入旧条: {curated:?}");
+    assert_eq!(curated[0].0, "cur-1");
+    assert_eq!(curated[0].1, "用户改用 Neovim");
+}
+
+/// FEAT-4：模型输出无法解析 → 回落全部 create（等价旧行为，能力不丢）。
+#[tokio::test]
+async fn unparseable_model_output_falls_back_to_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = oc_store::Store::open_memory().unwrap();
+    seed_candidate(&store, "ep-1", "用户常在周五做复盘").await;
+
+    let provider = Arc::new(oc_llm::mock::CapturingMock::new("这不是 JSON"));
+    let c = ConsolidateCtx {
+        provider: provider.clone(),
+        model: "mock".into(),
+        soul_dir: tmp.path().to_path_buf(),
+    };
+    let promoted = scan_with(&store, 0, &loose_cfg(), Some(&c)).await;
+    assert_eq!(promoted, 1, "解析失败应回落到 create 并仍巩固");
+
+    // 结果：ep-1 被 promote 成 curated（fallback 路径）。
+    let curated = store.curated_list().await.unwrap();
+    assert_eq!(curated.len(), 1);
+    assert_eq!(curated[0].0, "ep-1");
 }

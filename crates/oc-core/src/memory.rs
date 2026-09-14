@@ -70,6 +70,8 @@ pub struct MemCandidate {
     pub importance: f64,
     /// 最近使用时间（unix 秒）；None 用 created_at 兜底由调用方保证。
     pub last_used_secs: i64,
+    /// 来源追溯（FEAT-3）；`None` = 无出处。
+    pub source: Option<String>,
 }
 
 /// 排名结果。
@@ -336,7 +338,7 @@ mod tests {
     use super::*;
 
     fn cand(id: &str, tier: Tier, origin: Origin, text: &str, imp: f64, last: i64) -> MemCandidate {
-        MemCandidate { id: id.into(), tier, origin, text: text.into(), importance: imp, last_used_secs: last }
+        MemCandidate { id: id.into(), tier, origin, text: text.into(), importance: imp, last_used_secs: last, source: None }
     }
 
     #[test]

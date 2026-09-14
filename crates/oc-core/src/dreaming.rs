@@ -137,6 +137,133 @@ pub fn build_consolidation_prompt(existing: &str, items: &[&str]) -> String {
     s
 }
 
+// ── FEAT-4：巩固四动作（CREATE/CORROBORATE/REFINE/CORRECT）───────────────
+//
+// 借鉴 ReMe auto_dream Integrate 阶段的四种动作语义。原来巩固是「把新旧内容
+// 一起丢给模型自由重写 MEMORY.md」，合并黑盒、不可审计。这里把「每条新记忆
+// 该以何种动作落到哪条旧 curated」提炼成受约束的显式决策，落库 + 审计。
+
+/// 一条新记忆该对旧 curated 采取的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidateAction {
+    /// 没有相同抽象，新建一条。
+    Create,
+    /// 同一记忆再次出现，追加来源、强化表述。
+    Corroborate,
+    /// 新材料补充了边界/步骤/前提/适用范围。
+    Refine,
+    /// 新材料修正了旧节点的错误/遗漏/冲突。
+    Correct,
+}
+
+impl ConsolidateAction {
+    /// 审计用的短标签（如 `consolidate:create`）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConsolidateAction::Create => "create",
+            ConsolidateAction::Corroborate => "corroborate",
+            ConsolidateAction::Refine => "refine",
+            ConsolidateAction::Correct => "correct",
+        }
+    }
+}
+
+/// 模型针对一条新记忆做出的巩固决策。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ConsolidateItem {
+    /// 新记忆的 id（`mem-<hash>`）。
+    pub source_id: String,
+    /// 动作。
+    pub action: ConsolidateAction,
+    /// 动作落到哪条旧 curated（`Create` 时为 `None`）。
+    pub target_id: Option<String>,
+    /// 合并后的正文（`Create` 时为新记忆正文本身）。
+    pub merged_text: String,
+}
+
+/// 单次巩固轮的输出模型：一轮模型调用返回若干条决策。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ConsolidateResponse {
+    pub actions: Vec<ConsolidateItem>,
+}
+
+/// 巩固模型轮的结构化系统提示词（FEAT-4）。
+///
+/// 要求模型**只输出 JSON**，每个动作的语义被约束为四种之一。与 [`CONSOLIDATION_SYSTEM_PROMPT`]
+/// 的「防编造」是同一路数的防御：把夜间无人监督的合并从「自由发挥」收进四个标准动作，
+/// 每条都留痕可审计。
+pub const CONSOLIDATE_JSON_SYSTEM_PROMPT: &str = "\
+你在整合一批新的长期记忆候选（episodic）到既有的长期记忆（curated）里。
+
+对每一条新候选，判断它与既有 curated 的关系，并输出一个 JSON 数组。动作只有四种：
+- create：既有记忆里没有相同抽象，新建一条。target_id 为 null。
+- corroborate：同一事实再次出现，印证并强化旧条目。target_id 指向旧条目。
+- refine：新材料补充了边界、步骤、前提或适用范围。target_id 指向旧条目。
+- correct：新材料修正了旧条目的错误、遗漏或冲突。target_id 指向旧条目。
+
+规则：
+1. 只使用输入里已有的事实，**绝对不要**推断、扩写或编造任何未出现的信息。
+2. merged_text 是合并后的最终正文（对 create，等于候选原文；对其它动作，是
+   候选与旧条目合并、去重、修正后的表述）。
+3. 每条候选必须产生一条决策；找不到对应旧条目时用 create。
+4. 只输出 JSON，不要任何解释、前言或 Markdown 代码块。
+
+输出格式：
+{\"actions\":[{\"source_id\":\"...\",\"action\":\"create|corroborate|refine|correct\",\"target_id\":\"...\"|\"target_id\":null,\"merged_text\":\"...\"}]}";
+
+/// 组装巩固模型轮的结构化用户提示（FEAT-4，纯函数）。
+///
+/// `existing_curated` 是既有 curated 记忆（id + 正文）；`items` 是本轮双门通过的
+/// 新候选（id + 正文）。既有一并交给模型，让它能在旧条目上判断动作与落点。
+pub fn build_consolidate_decision_prompt(
+    existing_curated: &[(String, String)],
+    items: &[(String, String)],
+) -> String {
+    let mut s = String::new();
+    if !existing_curated.is_empty() {
+        s.push_str("## 既有长期记忆（curated）\n\n");
+        for (id, text) in existing_curated {
+            s.push_str(&format!("- [{id}] {}\n", text.trim()));
+        }
+        s.push('\n');
+    }
+    s.push_str("## 本轮新巩固候选（episodic）\n\n");
+    for (id, text) in items {
+        s.push_str(&format!("- [{id}] {}\n", text.trim()));
+    }
+    s.push_str("\n请按系统要求输出 JSON。");
+    s
+}
+
+/// 解析模型输出的结构化决策（FEAT-4，纯函数）。
+///
+/// 宽容解析：剥掉可能的 Markdown 代码块围栏，再从正文里找第一个 `{` 起的 JSON 对象。
+/// 失败返回 `None`，调用方回落到旧的自由重写路径（能力不因解析失败而丢）。
+pub fn parse_consolidations(raw: &str) -> Option<Vec<ConsolidateItem>> {
+    let trimmed = raw.trim();
+    // 模型常无视「不要包代码块」，剥掉 ```json ... ``` 围栏。
+    let json = if let Some(stripped) = trimmed
+        .strip_prefix("```")
+        .and_then(|s| s.strip_prefix("json").or(Some(s)))
+        .map(str::trim)
+        .and_then(|s| s.strip_suffix("```"))
+    {
+        stripped
+    } else {
+        trimmed
+    };
+    // 从第一个 '{' 起，到最后一个 '}' 止，容忍前后夹带文字。
+    let start = json.find('{')?;
+    let end = json.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let obj = &json[start..=end];
+    let resp: ConsolidateResponse = serde_json::from_str(obj).ok()?;
+    Some(resp.actions)
+}
+
 /// MEMORY.md 的写入决策（设计 §11.4「写安全：乐观并发」）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WritePlan {
@@ -312,5 +439,64 @@ mod tests {
         assert!(p.contains("- 有效"));
         // 空条目不该产生空的 "- " 行。
         assert!(!p.contains("- \n"), "空白条目应被跳过: {p:?}");
+    }
+
+    // ── FEAT-4：四动作决策解析 ─────────────────────────────────
+
+    #[test]
+    fn parse_consolidations_parses_plain_json() {
+        let raw = r#"{"actions":[{"source_id":"e1","action":"create","target_id":null,"merged_text":"新条目"}]}"#;
+        let items = parse_consolidations(raw).expect("应解析成功");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source_id, "e1");
+        assert_eq!(items[0].action, ConsolidateAction::Create);
+        assert_eq!(items[0].target_id, None);
+        assert_eq!(items[0].merged_text, "新条目");
+    }
+
+    #[test]
+    fn parse_consolidations_strips_code_fence() {
+        let raw = "```json\n{\"actions\":[{\"source_id\":\"e1\",\"action\":\"refine\",\"target_id\":\"c1\",\"merged_text\":\"补全后\"}]}\n```";
+        let items = parse_consolidations(raw).expect("应剥掉代码块围栏");
+        assert_eq!(items[0].action, ConsolidateAction::Refine);
+        assert_eq!(items[0].target_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn parse_consolidations_tolerates_surrounding_text() {
+        let raw = "好的，结果如下：\n{\"actions\":[{\"source_id\":\"e1\",\"action\":\"correct\",\"target_id\":\"c1\",\"merged_text\":\"修正后\"}]}\n以上。";
+        let items = parse_consolidations(raw).expect("应容忍前后夹带文字");
+        assert_eq!(items[0].action, ConsolidateAction::Correct);
+    }
+
+    #[test]
+    fn parse_consolidations_returns_none_on_garbage() {
+        assert!(parse_consolidations("这不是 JSON").is_none());
+        assert!(parse_consolidations("").is_none());
+        assert!(parse_consolidations("{}").is_none(), "缺 actions 字段应失败");
+    }
+
+    #[test]
+    fn parse_consolidations_rejects_unknown_action() {
+        // 未知动作值应解析失败（serde 严格枚举），而非静默映射。
+        let raw = r#"{"actions":[{"source_id":"e1","action":"hack","target_id":null,"merged_text":"x"}]}"#;
+        assert!(parse_consolidations(raw).is_none());
+    }
+
+    #[test]
+    fn decision_prompt_includes_both_sides() {
+        let p = build_consolidate_decision_prompt(
+            &[("c1".into(), "旧条目".into())],
+            &[("e1".into(), "新候选".into())],
+        );
+        assert!(p.contains("[c1] 旧条目"), "既有 curated 必须带 id 进 prompt: {p}");
+        assert!(p.contains("[e1] 新候选"), "新候选必须带 id 进 prompt: {p}");
+    }
+
+    #[test]
+    fn decision_prompt_skips_empty_curated_section() {
+        let p = build_consolidate_decision_prompt(&[], &[("e1".into(), "新候选".into())]);
+        assert!(!p.contains("既有长期记忆"), "无既有 curated 应跳过该节: {p}");
+        assert!(p.contains("[e1] 新候选"));
     }
 }

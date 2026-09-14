@@ -46,6 +46,7 @@ fn mem(id: &str, text: &str) -> NewMemory {
         importance: 0.8,
         content_hash: format!("h-{id}"),
         pref_key: None,
+        source: None,
     }
 }
 
@@ -421,6 +422,7 @@ async fn all_row_fields_round_trip_through_index_path() {
             importance: 0.75,
             content_hash: "hash-p1".into(),
             pref_key: Some("编辑器".into()),
+            source: Some("sess-p1".into()),
         })
         .await
         .unwrap();
@@ -436,4 +438,5 @@ async fn all_row_fields_round_trip_through_index_path() {
     assert_eq!(r.use_count, 0);
     assert_eq!(r.content_hash, "hash-p1");
     assert_eq!(r.pref_key.as_deref(), Some("编辑器"));
+    assert_eq!(r.source.as_deref(), Some("sess-p1"), "source 取回列");
 }

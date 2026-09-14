@@ -8,6 +8,7 @@ description = "oc 领域层：纯策略，无 IO"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 garde = { version = "0.22", features = ["derive"] }
 time = { version = "0.3", features = ["macros", "serde"] }
 time-tz = "2"

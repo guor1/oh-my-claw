@@ -183,12 +183,12 @@ pub fn compact_with_summary(
 pub fn upsert_memory(conn: &Connection, m: &NewMemory) -> StoreResult<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "INSERT INTO memory(id, tier, origin, text, keywords, importance, created_at, content_hash, pref_key)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO memory(id, tier, origin, text, keywords, importance, created_at, content_hash, pref_key, source)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
            text=excluded.text, keywords=excluded.keywords,
            importance=excluded.importance, content_hash=excluded.content_hash,
-           pref_key=excluded.pref_key",
+           pref_key=excluded.pref_key, source=excluded.source",
         params![
             m.id,
             m.tier.as_str(),
@@ -198,7 +198,8 @@ pub fn upsert_memory(conn: &Connection, m: &NewMemory) -> StoreResult<()> {
             m.importance,
             now_millis(),
             m.content_hash,
-            m.pref_key
+            m.pref_key,
+            m.source
         ],
     )?;
     // 拿这条记忆的 rowid：`last_insert_rowid` 在 ON CONFLICT 走更新分支时不更新，
@@ -370,7 +371,7 @@ pub fn intent_mark_fired(conn: &Connection, id: &str, fired_at: i64) -> StoreRes
 /// 按 use_count 降序取前 `limit` 条（先看反复用到的）。
 pub fn dream_candidates(conn: &Connection, limit: i64) -> StoreResult<Vec<MemoryRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, tier, origin, text, importance, created_at, last_used_at, use_count, content_hash, pref_key
+        "SELECT id, tier, origin, text, importance, created_at, last_used_at, use_count, content_hash, pref_key, source
          FROM memory WHERE tier = 'episodic'
          ORDER BY use_count DESC, created_at ASC
          LIMIT ?1",
@@ -387,6 +388,7 @@ pub fn dream_candidates(conn: &Connection, limit: i64) -> StoreResult<Vec<Memory
             use_count: r.get(7)?,
             content_hash: r.get(8)?,
             pref_key: r.get(9)?,
+            source: r.get(10)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -401,6 +403,61 @@ pub fn promote_memory(conn: &Connection, id: &str) -> StoreResult<()> {
          WHERE id = ?1 AND tier = 'episodic'",
         params![id],
     )?;
+    Ok(())
+}
+
+/// 取全部 curated 记忆（id + text），供巩固模型轮的「判断动作落点」用（FEAT-4）。
+pub fn curated_list(conn: &Connection) -> StoreResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, text FROM memory WHERE tier = 'curated' ORDER BY no")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// 把一条新记忆合并进一条既有 curated（FEAT-4 的 corroborate/refine/correct 动作）。
+///
+/// 事务内：用合并后的正文更新目标行（text/importance/content_hash + 重建 FTS），
+/// 再删掉源行（源是 episodic 候选，其内容已并入目标，不再单列）。源 = 目标时
+/// 退化为就地更新（不删自己）。
+///
+/// **顺序刻意先更后删**：中途失败最坏是源行暂存（下一轮重新判定），不会丢目标内容。
+pub fn merge_memory(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    merged_text: &str,
+    merged_content_hash: &str,
+) -> StoreResult<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    // 取目标行 rowid（FTS 索引按 rowid 关联）。
+    let target_no: Option<i64> = tx
+        .query_row("SELECT no FROM memory WHERE id = ?1", params![target_id], |r| r.get(0))
+        .optional()?;
+    let Some(target_no) = target_no else {
+        return Ok(()); // 目标不存在：无落点，安全放弃（源行留待下一轮）。
+    };
+
+    // 更新目标：正文、重要度下限、内容哈希。
+    tx.execute(
+        "UPDATE memory SET text = ?2, importance = MAX(importance, 0.6), content_hash = ?3
+         WHERE no = ?1",
+        params![target_no, merged_text, merged_content_hash],
+    )?;
+    // 重建目标 FTS 项（先删后插，见 [`upsert_memory`]）。
+    crate::ops::index_memory_text(&tx, target_no, merged_text)?;
+
+    // 源 ≠ 目标时删源（连同 FTS）。
+    if source_id != target_id {
+        if let Some(src_no) = tx
+            .query_row("SELECT no FROM memory WHERE id = ?1", params![source_id], |r| r.get::<_, i64>(0))
+            .optional()?
+        {
+            tx.execute("DELETE FROM memory WHERE no = ?1", params![src_no])?;
+            tx.execute("DELETE FROM memory_fts WHERE rowid = ?1", params![src_no])?;
+        }
+    }
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -452,7 +509,7 @@ fn fnv1a_hex(s: &str) -> String {
 /// 取值，却漏改动态拼接的 SELECT」，于是下标错位。清单与 mapper 各只有一份，
 /// 那类漂移就无从发生。
 const MEMORY_COLS: &str = "m.id, m.tier, m.origin, m.text, m.importance, m.created_at,
-     m.last_used_at, m.use_count, m.content_hash, m.pref_key";
+     m.last_used_at, m.use_count, m.content_hash, m.pref_key, m.source";
 
 /// [`MEMORY_COLS`] 的行映射。下标顺序必须与清单一致。
 fn map_memory_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
@@ -467,6 +524,7 @@ fn map_memory_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
         use_count: r.get(7)?,
         content_hash: r.get(8)?,
         pref_key: r.get(9)?,
+        source: r.get(10)?,
     })
 }
 
@@ -559,7 +617,7 @@ pub fn search_candidates(
 /// 不参与 supersede。按 created_at 升序（早建的在前，替换时优先命中最早那条）。
 pub fn memory_by_pref_key(conn: &Connection, key: &str) -> StoreResult<Vec<MemoryRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, tier, origin, text, importance, created_at, last_used_at, use_count, content_hash, pref_key
+        "SELECT id, tier, origin, text, importance, created_at, last_used_at, use_count, content_hash, pref_key, source
          FROM memory WHERE pref_key = ?1 AND tier = 'curated'
          ORDER BY created_at",
     )?;
@@ -575,6 +633,7 @@ pub fn memory_by_pref_key(conn: &Connection, key: &str) -> StoreResult<Vec<Memor
             use_count: r.get(7)?,
             content_hash: r.get(8)?,
             pref_key: r.get(9)?,
+            source: r.get(10)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)

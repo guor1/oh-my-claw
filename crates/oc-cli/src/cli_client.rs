@@ -231,7 +231,10 @@ pub fn memory_search(query: String, limit: Option<u32>) -> Result<()> {
                 println!("（无匹配记忆）");
             } else {
                 for h in hits {
-                    println!("[{:.3}] ({}) {}", h.score, h.tier, h.text);
+                    match &h.source {
+                        Some(src) => println!("[{:.3}] ({}) 来源:{} {}", h.score, h.tier, src, h.text),
+                        None => println!("[{:.3}] ({}) {}", h.score, h.tier, h.text),
+                    }
                 }
             }
         }

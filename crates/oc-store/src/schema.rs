@@ -130,6 +130,15 @@ ALTER TABLE memory ADD COLUMN pref_key TEXT;
 CREATE INDEX idx_memory_pref_key ON memory(pref_key);
 "#;
 
+/// v3：来源追溯列（FEAT-3，设计 §4.1 来源追溯链）。
+///
+/// `source` 记这条记忆的出处（如 flush 出它的 session_id），与 `origin`（信任
+/// 分级：谁写的）正交。`origin` 答「可信不可信」，`source` 答「从哪来」。可空：
+/// 用户显式「记住…」与历史既有行不强制带来源。
+pub const V3: &str = r#"
+ALTER TABLE memory ADD COLUMN source TEXT;
+"#;
+
 /// sqlite-vec 虚表（feature `sqlite-vec`）。维度随 embedding 模型，暂定 768。
 #[cfg(feature = "sqlite-vec")]
 pub const V1_VEC: &str = r#"

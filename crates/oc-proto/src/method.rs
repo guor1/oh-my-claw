@@ -347,6 +347,8 @@ pub struct MemHit {
     pub tier: String,
     pub text: String,
     pub score: f32,
+    /// 来源追溯（FEAT-3）；`None` = 无出处。
+    pub source: Option<String>,
 }
 
 // ── 诊断快照（oc debug）────────────────────────────────────────

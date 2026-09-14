@@ -236,6 +236,9 @@ pub struct NewMemory {
     /// （同主题的新值就地替换旧值）；`None` = 普通记忆，走内容哈希去重。
     /// 由 `oc_core::memory::extract_pref_key` 判定，调用方填入。
     pub pref_key: Option<String>,
+    /// 来源追溯（FEAT-3，设计 §4.1）：这条记忆的出处（如 flush 出它的 session_id）。
+    /// 与 `origin`（信任分级）正交；`None` = 无出处（用户显式「记住…」或历史行）。
+    pub source: Option<String>,
 }
 
 /// 待写入的一条定时任务。
@@ -307,4 +310,6 @@ pub struct MemoryRow {
     pub content_hash: String,
     /// 偏好主题；`None` = 非偏好类记忆。见 [`NewMemory::pref_key`]。
     pub pref_key: Option<String>,
+    /// 来源追溯；`None` = 无出处。见 [`NewMemory::source`]。
+    pub source: Option<String>,
 }

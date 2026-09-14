@@ -481,7 +481,7 @@ async fn begin_run(
     debug!(session = %sid, run_id = %turn.run_id, ms = t0.elapsed().as_millis(), "落库用户消息完成");
 
     // 显式"记住…"写入路径（设计 §4.1）：用户显式指令 → curated + Owner + 审计。
-    persist_explicit_memory(store, &turn.text).await;
+    persist_explicit_memory(store, &sid, &turn.text).await;
 
     // 加载历史（含刚落库的本轮用户消息）+ Lane1 记忆检索。
     let th = std::time::Instant::now();
@@ -924,6 +924,8 @@ async fn flush_episodic(
             content_hash: hash,
             // 情节记忆不参与偏好 supersede（那是 curated 的事）。
             pref_key: None,
+            // FEAT-3：记来源 session，晋升 curated 时随行继承。
+            source: Some(session_id.to_string()),
         };
         match store.writer().upsert_memory(mem).await {
             Ok(()) => written += 1,
@@ -1008,7 +1010,7 @@ fn tokenize(msg: &str) -> Vec<String> {
 /// - 归不到主题 → 走原路径（upsert，靠内容哈希去重），行为不变。
 ///
 /// **失败仅告警，不阻塞回复**。
-async fn persist_explicit_memory(store: &oc_store::Store, user_msg: &str) {
+async fn persist_explicit_memory(store: &oc_store::Store, session_id: &str, user_msg: &str) {
     use oc_core::memory::{
         classify_origin, detect_explicit_memory, extract_pref_key, supersede, Pref, SupersedePlan,
         WriteSource,
@@ -1075,6 +1077,8 @@ async fn persist_explicit_memory(store: &oc_store::Store, user_msg: &str) {
         importance: 0.8, // 用户显式指定 → 高重要度。
         content_hash: hash,
         pref_key: pref_key.clone(),
+        // FEAT-3：用户显式「记住…」也记来源会话，保留出处链。
+        source: Some(session_id.to_string()),
     };
 
     if let Err(e) = store.writer().upsert_memory(mem).await {
@@ -1168,6 +1172,7 @@ async fn lane1_bootstrap(
             text: r.text.clone(),
             importance: r.importance,
             last_used_secs: r.last_used_at.unwrap_or(r.created_at) / 1000,
+            source: r.source.clone(),
         })
         .collect();
 

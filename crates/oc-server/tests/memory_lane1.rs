@@ -43,6 +43,7 @@ async fn curated_memory_injected_on_relevant_message() {
         importance: 0.9,
         content_hash: "h".into(),
         pref_key: None,
+        source: None,
     })
     .await
     .unwrap();
@@ -78,6 +79,7 @@ async fn irrelevant_message_does_not_inject() {
         importance: 0.9,
         content_hash: "h".into(),
         pref_key: None,
+        source: None,
     })
     .await
     .unwrap();

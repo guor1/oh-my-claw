@@ -77,6 +77,16 @@ pub enum WriteCmd {
         id: String,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    MergeMemory {
+        source_id: String,
+        target_id: String,
+        merged_text: String,
+        merged_content_hash: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    CuratedList {
+        reply: oneshot::Sender<StoreResult<Vec<(String, String)>>>,
+    },
     MemoryByPrefKey {
         key: String,
         reply: oneshot::Sender<StoreResult<Vec<crate::types::MemoryRow>>>,
@@ -256,6 +266,21 @@ impl Writer {
     writer_call!(promote_memory(id: String) -> () => PromoteMemory { id });
 
     writer_call!(
+        /// 把一条新记忆合并进既有 curated（FEAT-4 四动作的非 create 分支）。
+        merge_memory(
+            source_id: String,
+            target_id: String,
+            merged_text: String,
+            merged_content_hash: String,
+        ) -> () => MergeMemory { source_id, target_id, merged_text, merged_content_hash }
+    );
+
+    writer_call!(
+        /// 取全部 curated（id + text），供巩固模型轮判断动作落点。
+        curated_list() -> Vec<(String, String)> => CuratedList {}
+    );
+
+    writer_call!(
         /// 按偏好主题取既有偏好（供 supersede 判冲突）。
         memory_by_pref_key(key: String) -> Vec<crate::types::MemoryRow> => MemoryByPrefKey { key });
 
@@ -326,6 +351,12 @@ fn run_loop(conn: Connection, rx: &mut mpsc::UnboundedReceiver<WriteCmd>) {
             }
             WriteCmd::PromoteMemory { id, reply } => {
                 let _ = reply.send(ops::promote_memory(&conn, &id));
+            }
+            WriteCmd::MergeMemory { source_id, target_id, merged_text, merged_content_hash, reply } => {
+                let _ = reply.send(ops::merge_memory(&conn, &source_id, &target_id, &merged_text, &merged_content_hash));
+            }
+            WriteCmd::CuratedList { reply } => {
+                let _ = reply.send(ops::curated_list(&conn));
             }
             WriteCmd::MemoryByPrefKey { key, reply } => {
                 let _ = reply.send(ops::memory_by_pref_key(&conn, &key));

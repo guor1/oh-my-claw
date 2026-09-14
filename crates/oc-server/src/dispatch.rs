@@ -461,6 +461,7 @@ async fn handle_memory_search(
             text: r.text.clone(),
             importance: r.importance,
             last_used_secs: r.last_used_at.unwrap_or(r.created_at) / 1000,
+            source: r.source.clone(),
         })
         .collect();
 
@@ -482,6 +483,7 @@ async fn handle_memory_search(
                 .to_string(),
                 text: c.text.clone(),
                 score: r.score as f32,
+                source: c.source.clone(),
             })
         })
         .collect();
@@ -743,6 +745,7 @@ pub(crate) async fn memory_text(
             text: r.text.clone(),
             importance: r.importance,
             last_used_secs: r.last_used_at.unwrap_or(r.created_at) / 1000,
+            source: r.source.clone(),
         })
         .collect();
 
