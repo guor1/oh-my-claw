@@ -22,6 +22,10 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
 
     #[garde(dive)]
+    #[serde(default)]
+    pub context: ContextConfig,
+
+    #[garde(dive)]
     pub memory: MemoryConfig,
 
     #[garde(dive)]
@@ -92,6 +96,26 @@ pub struct ModelConfig {
     #[garde(skip)]
     #[serde(default)]
     pub max_tokens_field: Option<String>,
+}
+
+/// 上下文预算与自动压缩配置（`[context]` 节）。
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct ContextConfig {
+    /// 每轮发给模型的历史 token 上限（输入侧）。默认 16384。
+    #[garde(range(min = 1024))]
+    pub history_token_budget: u32,
+    /// 每轮结束后历史超出预算水位时自动滚动摘要压缩。默认 true。
+    #[garde(skip)]
+    pub auto_compact: bool,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            history_token_budget: 16_384,
+            auto_compact: true,
+        }
+    }
 }
 
 /// 保守默认上下文窗口（内置表与手填都缺时兜底）。
@@ -323,6 +347,7 @@ impl Config {
                 max_output_tokens: None,
                 max_tokens_field: None,
             }],
+            context: ContextConfig::default(),
             memory: MemoryConfig {
                 vec: true,
                 halflife_days: 30,
@@ -496,5 +521,89 @@ abort_min_secs = 300
 "#).expect("旧配置应能加载");
         assert!(cfg.skills.allowlist.is_empty());
         assert!(cfg.skills.denylist.is_empty());
+    }
+
+    /// 现网 config.toml 没有 [context] 节，缺省必须拿到默认预算 + 自动压缩开。
+    #[test]
+    fn context_section_defaults_when_absent() {
+        let cfg: Config = toml::from_str(r#"
+proto_version = 1
+[server]
+transport = "pipe"
+[[models]]
+alias = "default"
+provider = "openai"
+model = "m"
+hosting = "cloud"
+api_key = { env = "K" }
+[memory]
+vec = true
+halflife_days = 30
+trigger_threshold = 0.72
+trigger_max_per_turn = 3
+[proactive]
+heartbeat_secs = 60
+intent_cooldown_secs = 86400
+intent_budget = 3
+intent_expiry_days = 90
+[tools]
+exec_timeout_secs = 120
+[tools.approval]
+mode = "prompt"
+[watchdog]
+idle_cloud_secs = 120
+idle_self_secs = 300
+run_timeout_secs = 0
+abort_min_secs = 300
+"#).expect("无 [context] 节也应能加载");
+        assert_eq!(cfg.context.history_token_budget, 16_384, "缺省预算应为 16K");
+        assert!(cfg.context.auto_compact, "缺省应开启自动压缩");
+        assert!(cfg.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn context_explicit_wins() {
+        let cfg: Config = toml::from_str(r#"
+proto_version = 1
+[server]
+transport = "pipe"
+[[models]]
+alias = "default"
+provider = "openai"
+model = "m"
+hosting = "cloud"
+api_key = { env = "K" }
+[context]
+history_token_budget = 8192
+auto_compact = false
+[memory]
+vec = true
+halflife_days = 30
+trigger_threshold = 0.72
+trigger_max_per_turn = 3
+[proactive]
+heartbeat_secs = 60
+intent_cooldown_secs = 86400
+intent_budget = 3
+intent_expiry_days = 90
+[tools]
+exec_timeout_secs = 120
+[tools.approval]
+mode = "prompt"
+[watchdog]
+idle_cloud_secs = 120
+idle_self_secs = 300
+run_timeout_secs = 0
+abort_min_secs = 300
+"#).expect("显式 [context] 应能解析");
+        assert_eq!(cfg.context.history_token_budget, 8192);
+        assert!(!cfg.context.auto_compact);
+    }
+
+    #[test]
+    fn context_budget_below_min_rejected() {
+        let mut cfg = Config::default_local();
+        cfg.context.history_token_budget = 512;
+        assert!(cfg.validate_shape().is_err(), "预算低于 1024 应校验失败");
     }
 }

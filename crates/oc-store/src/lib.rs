@@ -373,6 +373,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_with_summary_does_not_rewind_reset_at() {
+        use crate::types::{NewEntry, Role};
+        let store = Store::open_memory().expect("open");
+        let w = store.writer();
+        w.ensure_session("main".into(), "main".into()).await.unwrap();
+
+        for (role, text) in [
+            (Role::User, "第一个问题"),
+            (Role::Assistant, "第一个回答"),
+            (Role::User, "第二个问题"),
+            (Role::Assistant, "第二个回答"),
+            (Role::User, "最近的问题"),
+        ] {
+            w.append_entry(NewEntry::text("main", role, text, 2)).await.unwrap();
+        }
+
+        // 用户先 /reset：reset_at 推进到最大 seq(5)。
+        w.reset_session("main".into()).await.unwrap();
+
+        // 后台压缩拿着旧快照 up_to_seq=4 后提交：不得把 reset_at 拉回 4。
+        w.compact_with_summary("main".into(), 4, "旧快照的摘要".into())
+            .await
+            .unwrap();
+
+        // reset_at 仍为 5 → 只回 seq>5。摘要 entry(seq6) 在 reset 之后，属正常可见；
+        // 但若 up_to_seq=4 把 reset_at 拉回 4，会错误地重新暴露 seq5（"最近的问题"）。
+        let hist = w.load_transcript("main".into(), 100).await.unwrap();
+        assert!(
+            !hist.iter().any(|e| e.content.contains("最近的问题")),
+            "reset_at 不得被旧快照拉回，seq5 不得重新暴露: {hist:?}"
+        );
+        assert!(
+            hist.iter().any(|e| e.content.contains("上下文摘要")),
+            "摘要 entry 应保留（在 reset 之后）: {hist:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_upsert_and_search() {
         use crate::types::{NewMemory, Origin, Tier};
         let store = Store::open_memory().expect("open");

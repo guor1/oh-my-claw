@@ -48,6 +48,15 @@ base_url = "https://api.deepseek.com"     # DeepSeek 端点
 #   { inline = "sk-xxxx" }  直接写（不建议，明文）
 api_key = { env = "DEEPSEEK_API_KEY" }
 
+# ── 上下文 ─────────────────────────────────────────────────────
+# 每轮发给模型的历史 token 上限（输入侧）。默认 16384。
+# 聊得越久，超出的旧对话会被自动滚动摘要压缩成结构化 checkpoint，
+# 后续轮次只读摘要 + 最近几轮，省 token、也更快。
+# 比旧行为（budget = 窗口 − 16384，几乎整段重发）收敛得多。
+[context]
+history_token_budget = 16384   # 每轮历史 token 上限（>= 1024）
+auto_compact = true            # 每轮结束后自动滚动摘要压缩
+
 [memory]
 vec = false                # M5 接入 embedding 前先关
 halflife_days = 30

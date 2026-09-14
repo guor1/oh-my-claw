@@ -5,6 +5,7 @@
 //! panic 隔离：run 主体用 catch_unwind 包裹（设计 §10.3）。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use oc_core::agent::RunOutcome;
@@ -38,6 +39,8 @@ pub struct SessionConfig {
     pub max_history_entries: i64,
     /// 历史 token 预算（超出则丢弃更早的消息）。
     pub history_token_budget: i64,
+    /// 每轮结束后历史超预算水位时自动滚动摘要压缩（[context] 节）。
+    pub auto_compact: bool,
     /// SOUL.md 人格文本（每轮由 oc-core::prompt 确定性组装进系统提示词）。
     pub soul: String,
     /// 加载的技能文档（~/.oc/skills/*.md），确定性排序后注入 prompt（设计 §4.4）。
@@ -246,6 +249,9 @@ async fn actor_loop(
     // 且随后的 Finished 会刷新时钟。
     let mut last_activity = tokio::time::Instant::now();
 
+    // 压缩在途守卫：手动 /compact 与每轮结束后的自动压缩共用，防两个摘要并发叠加。
+    let compact_in_flight = Arc::new(AtomicBool::new(false));
+
     // 确保本会话存在。kind 统一记为 "main"（用户会话）；cron/dreaming 等隔离
     // 子会话不经本 actor，细分留待后续。
     if let Err(e) = store
@@ -326,13 +332,14 @@ async fn actor_loop(
                 let tc = std::time::Instant::now();
                 info!(session = %sid, "compact 开始（占用车道）");
                 diag.compact_start();
-                compact_session(&store, &cfg, &provider, &events, &sid).await;
+                compact_session(&store, &cfg, &provider, &events, &sid, &compact_in_flight).await;
                 diag.compact_done();
                 info!(session = %sid, ms = tc.elapsed().as_millis(), "compact 结束");
             }
             SessionCmd::Finished { run_id, outcome } => {
                 last_activity = tokio::time::Instant::now();
                 if active.as_ref().map(|a| &a.run_id) == Some(&run_id) {
+                    let completed = matches!(outcome, RunOutcome::Completed);
                     let elapsed = active.as_ref().map(|a| a.started_at.elapsed().as_millis()).unwrap_or(0);
                     // 日志汇总：抓 diag 在 run_done 清空前留下的工具轮数，跟终态并到
                     // 一条日志里——这样「run 完成」与「run 非正常终态」两条 INFO/WARN
@@ -361,6 +368,18 @@ async fn actor_loop(
                             )
                             .await,
                         );
+                    }
+                    // 每轮结束后自动滚动压缩（后台，不占车道）。仅正常结束且开启
+                    // auto_compact 时触发；水位不足或已有压缩在途时内部自会跳过。
+                    if completed && cfg.auto_compact {
+                        let store_c = store.clone();
+                        let cfg_c = cfg.clone();
+                        let provider_c = Arc::clone(&provider);
+                        let sid_c = sid.clone();
+                        let guard_c = Arc::clone(&compact_in_flight);
+                        tokio::spawn(async move {
+                            maybe_auto_compact(&store_c, &cfg_c, &provider_c, &sid_c, &guard_c).await;
+                        });
                     }
                 }
             }
@@ -700,17 +719,27 @@ fn drop_orphan_tool_msgs(msgs: &mut Vec<oc_llm::Message>) {
     });
 }
 
-/// 手动/自动摘要压缩：把 reset 之后、除最近 keep_recent 条以外的历史总结成一条
-/// checkpoint，落库（推进 reset_at + 插摘要 entry）。失败仅告警，不影响后续。
+/// 一次摘要压缩的结果分类（手动与自动路径共用）。
+#[derive(Debug)]
+enum CompactOutcome {
+    /// 压缩完成，落库 checkpoint。`older_count` = 被摘要的历史条数。
+    Summarized { older_count: usize },
+    /// 历史太短，不值得压缩。`entries` = 当前条数。
+    TooShort { entries: usize },
+    /// 加载/摘要/写入失败，降级不压缩。`&'static str` = 具体环节（拼"压缩失败："前缀）。
+    Failed(&'static str),
+}
+
+/// 摘要压缩的核心序列：加载 → 沉淀 episodic → 调摘要模型 → 落库 checkpoint。
 ///
-/// keep_recent 取压缩配置的近期保留条数（沿用 CompactCfg 默认语义）。
-async fn compact_session(
+/// 手动 `/compact` 与自动压缩共用。失败绝不 panic，返回 [`CompactOutcome::Failed`]
+/// 由调用方决定是否通知用户（手动要通知，自动静默打日志）。
+async fn compact_core(
     store: &oc_store::Store,
     cfg: &SessionConfig,
     provider: &Arc<dyn Provider>,
-    events: &broadcast::Sender<Event>,
     session_id: &str,
-) {
+) -> CompactOutcome {
     let keep_recent = oc_core::compaction::CompactCfg::default().keep_recent;
 
     let entries = match store
@@ -721,26 +750,17 @@ async fn compact_session(
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "compact：加载历史失败");
-            notify_compact(events, session_id, "压缩失败：加载历史出错");
-            return;
+            return CompactOutcome::Failed("加载历史出错");
         }
     };
-    // 少于阈值不值得压缩：给出明确反馈，而非静默跳过。
     if entries.len() <= keep_recent + 1 {
-        notify_compact(
-            events,
-            session_id,
-            &format!("当前上下文较短（{} 条），无需压缩", entries.len()),
-        );
-        return;
+        return CompactOutcome::TooShort { entries: entries.len() };
     }
 
-    // 切点：保留最近 keep_recent 条，其余进摘要区。
     let cut = entries.len() - keep_recent;
     let older = &entries[..cut];
     let up_to_seq = older.last().map(|e| e.seq).unwrap_or(0);
 
-    // 映射为 llm 消息喂给摘要模型。
     let msgs: Vec<oc_llm::Message> = older
         .iter()
         .map(|e| oc_llm::Message {
@@ -757,12 +777,7 @@ async fn compact_session(
         })
         .collect();
 
-    // 摘要之前先沉淀 episodic 候选（设计 §11.5，P1-6）。
-    //
-    // 顺序刻意在调模型**之前**：摘要是有损的（多条压成一段），且模型调用可能失败。
-    // 放在后面的话，摘要失败就连沉淀一起丢——而这批历史正要被摘要取代，
-    // 是它们进入长期记忆的最后机会。
-    // 只 flush 进摘要区的那部分（`older`）；保留区还在上下文里，等下次压缩再说。
+    // 摘要之前先沉淀 episodic 候选（设计 §11.5，P1-6）。顺序刻意在调模型之前。
     flush_episodic(store, session_id, older).await;
 
     let older_count = older.len();
@@ -770,8 +785,7 @@ async fn compact_session(
     info!(session = %session_id, msgs = older_count, input_chars, "compact：调摘要模型");
     let Some(summary) = crate::summarize::summarize(provider, &cfg.model, &msgs).await else {
         warn!(session = %session_id, msgs = older_count, "compact：摘要为空/失败，跳过");
-        notify_compact(events, session_id, "压缩失败：摘要生成为空或超时");
-        return;
+        return CompactOutcome::Failed("摘要生成为空或超时");
     };
 
     if let Err(e) = store
@@ -780,15 +794,78 @@ async fn compact_session(
         .await
     {
         warn!(error = %e, "compact：落库失败");
-        notify_compact(events, session_id, "压缩失败：写入出错");
+        return CompactOutcome::Failed("写入出错");
+    }
+
+    CompactOutcome::Summarized { older_count }
+}
+
+/// 手动压缩指定会话：调用核心序列后，按结果回发用户通知。
+async fn compact_session(
+    store: &oc_store::Store,
+    cfg: &SessionConfig,
+    provider: &Arc<dyn Provider>,
+    events: &broadcast::Sender<Event>,
+    session_id: &str,
+    guard: &Arc<AtomicBool>,
+) {
+    // 抢在途守卫：自动压缩可能在后台跑。抢不到说明已有压缩进行中，提示而非叠加。
+    if guard.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        notify_compact(events, session_id, "正在压缩中，请稍后再试");
+        return;
+    }
+    let outcome = compact_core(store, cfg, provider, session_id).await;
+    guard.store(false, Ordering::Release);
+    match outcome {
+        CompactOutcome::Summarized { older_count } => notify_compact(
+            events,
+            session_id,
+            &format!("已压缩上下文：{older_count} 条历史消息总结为摘要"),
+        ),
+        CompactOutcome::TooShort { entries } => notify_compact(
+            events,
+            session_id,
+            &format!("当前上下文较短（{entries} 条），无需压缩"),
+        ),
+        CompactOutcome::Failed(step) => {
+            notify_compact(events, session_id, &format!("压缩失败：{step}"));
+        }
+    }
+}
+
+/// 每轮结束后的自动滚动摘要压缩：水位不足或已有压缩在途则跳过（静默）。
+async fn maybe_auto_compact(
+    store: &oc_store::Store,
+    cfg: &SessionConfig,
+    provider: &Arc<dyn Provider>,
+    session_id: &str,
+    guard: &Arc<AtomicBool>,
+) {
+    // 水位判定：transcript 总 token 估算 ≤ 预算 × 0.8 则不压。
+    let entries = match store
+        .writer()
+        .load_transcript(session_id.into(), cfg.max_history_entries)
+        .await
+    {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "auto compact：加载历史失败，跳过");
+            return;
+        }
+    };
+    let total: i64 = entries.iter().map(|e| e.tokens_est.max(1)).sum();
+    if total <= cfg.history_token_budget * 4 / 5 {
         return;
     }
 
-    notify_compact(
-        events,
-        session_id,
-        &format!("已压缩上下文：{older_count} 条历史消息总结为摘要"),
-    );
+    // 抢在途守卫：与手动 /compact 互斥。抢不到说明已有压缩进行中，直接返回。
+    if guard.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    let outcome = compact_core(store, cfg, provider, session_id).await;
+    guard.store(false, Ordering::Release);
+    // 自动压缩静默：只打日志，不向用户弹通知（每 ~16K 对话弹一次会骚扰）。
+    info!(session = %session_id, ?outcome, "auto compact 完成");
 }
 
 /// 把一段会话历史沉淀为 episodic 记忆候选（设计 §11.5，P1-6）。

@@ -130,11 +130,15 @@ pub fn load_transcript(conn: &Connection, session_id: &str, max_entries: i64) ->
     Ok(out)
 }
 
-/// 摘要式压缩：把 `seq <= up_to_seq` 的对话压成一条摘要 entry，并推进 reset_at
-/// 到 up_to_seq（排除被摘要的原始区间，但保留 transcript 供审计）。
+/// 摘要式压缩：把 `seq <= up_to_seq` 的对话压成一条摘要 entry，并把 reset_at
+/// 单调推进到 up_to_seq（排除被摘要的原始区间，但保留 transcript 供审计）。
 ///
 /// 事务内完成：插入 System 角色的摘要 entry（seq 在 max+1，落在 reset 之后故会被
 /// 后续 load 取到）+ 更新 reset_at。摘要文本由 server 调模型生成后传入。
+///
+/// reset_at 只前进、不后退：后台压缩的 up_to_seq 可能来自旧快照，若并发的
+/// /reset 已把 reset_at 推到更大值，这里用 `MAX(COALESCE(reset_at,0), ?2)` 保证
+/// 提交后不会把 reset_at 拉回旧值、重新暴露用户刚清除的历史。
 pub fn compact_with_summary(
     conn: &Connection,
     session_id: &str,
@@ -158,9 +162,10 @@ pub fn compact_with_summary(
          VALUES(?1, ?2, 'system', ?3, ?4, ?5)",
         params![session_id, next_seq, content, tokens_est, now_millis()],
     )?;
-    // 推进 reset_at 到 up_to_seq：排除原始被摘要区间，但摘要 entry(seq=next_seq)保留。
+    // 单调推进 reset_at：只前进、不后退。并发 /reset 可能已把 reset_at 推到更大的
+    // seq，这里用 MAX(COALESCE(reset_at,0), ?2) 保证旧快照的 up_to_seq 不会把它拉回。
     tx.execute(
-        "UPDATE session SET reset_at = ?2 WHERE id = ?1",
+        "UPDATE session SET reset_at = MAX(COALESCE(reset_at, 0), ?2) WHERE id = ?1",
         params![session_id, up_to_seq],
     )?;
     tx.commit()?;
