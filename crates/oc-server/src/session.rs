@@ -702,17 +702,27 @@ fn drop_orphan_tool_msgs(msgs: &mut Vec<oc_llm::Message>) {
     });
 }
 
-/// 手动/自动摘要压缩：把 reset 之后、除最近 keep_recent 条以外的历史总结成一条
-/// checkpoint，落库（推进 reset_at + 插摘要 entry）。失败仅告警，不影响后续。
+/// 一次摘要压缩的结果分类（手动与自动路径共用）。
+#[derive(Debug)]
+enum CompactOutcome {
+    /// 压缩完成，落库 checkpoint。`older_count` = 被摘要的历史条数。
+    Summarized { older_count: usize },
+    /// 历史太短，不值得压缩。`entries` = 当前条数。
+    TooShort { entries: usize },
+    /// 加载/摘要/写入失败，降级不压缩。`&'static str` = 具体环节（拼"压缩失败："前缀）。
+    Failed(&'static str),
+}
+
+/// 摘要压缩的核心序列：加载 → 沉淀 episodic → 调摘要模型 → 落库 checkpoint。
 ///
-/// keep_recent 取压缩配置的近期保留条数（沿用 CompactCfg 默认语义）。
-async fn compact_session(
+/// 手动 `/compact` 与自动压缩共用。失败绝不 panic，返回 [`CompactOutcome::Failed`]
+/// 由调用方决定是否通知用户（手动要通知，自动静默打日志）。
+async fn compact_core(
     store: &oc_store::Store,
     cfg: &SessionConfig,
     provider: &Arc<dyn Provider>,
-    events: &broadcast::Sender<Event>,
     session_id: &str,
-) {
+) -> CompactOutcome {
     let keep_recent = oc_core::compaction::CompactCfg::default().keep_recent;
 
     let entries = match store
@@ -723,26 +733,17 @@ async fn compact_session(
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "compact：加载历史失败");
-            notify_compact(events, session_id, "压缩失败：加载历史出错");
-            return;
+            return CompactOutcome::Failed("加载历史出错");
         }
     };
-    // 少于阈值不值得压缩：给出明确反馈，而非静默跳过。
     if entries.len() <= keep_recent + 1 {
-        notify_compact(
-            events,
-            session_id,
-            &format!("当前上下文较短（{} 条），无需压缩", entries.len()),
-        );
-        return;
+        return CompactOutcome::TooShort { entries: entries.len() };
     }
 
-    // 切点：保留最近 keep_recent 条，其余进摘要区。
     let cut = entries.len() - keep_recent;
     let older = &entries[..cut];
     let up_to_seq = older.last().map(|e| e.seq).unwrap_or(0);
 
-    // 映射为 llm 消息喂给摘要模型。
     let msgs: Vec<oc_llm::Message> = older
         .iter()
         .map(|e| oc_llm::Message {
@@ -759,12 +760,7 @@ async fn compact_session(
         })
         .collect();
 
-    // 摘要之前先沉淀 episodic 候选（设计 §11.5，P1-6）。
-    //
-    // 顺序刻意在调模型**之前**：摘要是有损的（多条压成一段），且模型调用可能失败。
-    // 放在后面的话，摘要失败就连沉淀一起丢——而这批历史正要被摘要取代，
-    // 是它们进入长期记忆的最后机会。
-    // 只 flush 进摘要区的那部分（`older`）；保留区还在上下文里，等下次压缩再说。
+    // 摘要之前先沉淀 episodic 候选（设计 §11.5，P1-6）。顺序刻意在调模型之前。
     flush_episodic(store, session_id, older).await;
 
     let older_count = older.len();
@@ -772,8 +768,7 @@ async fn compact_session(
     info!(session = %session_id, msgs = older_count, input_chars, "compact：调摘要模型");
     let Some(summary) = crate::summarize::summarize(provider, &cfg.model, &msgs).await else {
         warn!(session = %session_id, msgs = older_count, "compact：摘要为空/失败，跳过");
-        notify_compact(events, session_id, "压缩失败：摘要生成为空或超时");
-        return;
+        return CompactOutcome::Failed("摘要生成为空或超时");
     };
 
     if let Err(e) = store
@@ -782,15 +777,35 @@ async fn compact_session(
         .await
     {
         warn!(error = %e, "compact：落库失败");
-        notify_compact(events, session_id, "压缩失败：写入出错");
-        return;
+        return CompactOutcome::Failed("写入出错");
     }
 
-    notify_compact(
-        events,
-        session_id,
-        &format!("已压缩上下文：{older_count} 条历史消息总结为摘要"),
-    );
+    CompactOutcome::Summarized { older_count }
+}
+
+/// 手动压缩指定会话：调用核心序列后，按结果回发用户通知。
+async fn compact_session(
+    store: &oc_store::Store,
+    cfg: &SessionConfig,
+    provider: &Arc<dyn Provider>,
+    events: &broadcast::Sender<Event>,
+    session_id: &str,
+) {
+    match compact_core(store, cfg, provider, session_id).await {
+        CompactOutcome::Summarized { older_count } => notify_compact(
+            events,
+            session_id,
+            &format!("已压缩上下文：{older_count} 条历史消息总结为摘要"),
+        ),
+        CompactOutcome::TooShort { entries } => notify_compact(
+            events,
+            session_id,
+            &format!("当前上下文较短（{entries} 条），无需压缩"),
+        ),
+        CompactOutcome::Failed(step) => {
+            notify_compact(events, session_id, &format!("压缩失败：{step}"));
+        }
+    }
 }
 
 /// 把一段会话历史沉淀为 episodic 记忆候选（设计 §11.5，P1-6）。
