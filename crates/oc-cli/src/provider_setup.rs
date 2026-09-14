@@ -32,10 +32,11 @@ pub fn build(cfg: &Config) -> Result<(Arc<dyn Provider>, SessionConfig, Duration
         Hosting::SelfHosted => cfg.watchdog.idle_self_secs,
     };
 
-    // 上下文窗口 → 压缩/历史预算（budget = window − reserve，保底 MIN）。
+    // 上下文窗口 → 历史预算：请求值夹进 (MIN, window−reserve) 区间。
     let context_window = model.effective_context_window() as i64;
-    let budget =
-        oc_core::compaction::CompactCfg::from_window(context_window, oc_core::compaction::DEFAULT_RESERVE_TOKENS).budget;
+    let budget = (cfg.context.history_token_budget as i64)
+        .min(context_window - oc_core::compaction::DEFAULT_RESERVE_TOKENS)
+        .max(oc_core::compaction::MIN_BUDGET_TOKENS);
 
     // 组装工具注册表（exec + file）。
     let tools = build_tools(cfg)?;
@@ -56,6 +57,7 @@ pub fn build(cfg: &Config) -> Result<(Arc<dyn Provider>, SessionConfig, Duration
         abort_min_secs: cfg.watchdog.abort_min_secs,
         max_history_entries: 200,
         history_token_budget: budget,
+        auto_compact: cfg.context.auto_compact,
         soul: load_soul(),
         skills: crate::skills_loader::load(&cfg.skills, std::env::consts::OS),
         trigger_threshold: cfg.memory.trigger_threshold as f64,

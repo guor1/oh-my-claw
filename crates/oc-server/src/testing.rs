@@ -47,6 +47,7 @@ pub fn test_cfg() -> SessionConfig {
         abort_min_secs: 300,
         max_history_entries: 200,
         history_token_budget: 8000,
+        auto_compact: false,
         soul: String::new(),
         skills: Vec::new(),
         trigger_threshold: 0.72,
@@ -74,6 +75,7 @@ pub trait SessionConfigExt: Sized {
     /// 挂工具执行器（默认 `None` = 纯对话）。
     fn with_tools(self, tools: crate::tools_bridge::ToolExecutor) -> Self;
     fn with_context_window(self, window: u32) -> Self;
+    fn with_auto_compact(self, on: bool) -> Self;
 }
 
 impl SessionConfigExt for SessionConfig {
@@ -113,6 +115,10 @@ impl SessionConfigExt for SessionConfig {
     }
     fn with_context_window(mut self, window: u32) -> Self {
         self.context_window = window;
+        self
+    }
+    fn with_auto_compact(mut self, on: bool) -> Self {
+        self.auto_compact = on;
         self
     }
 }

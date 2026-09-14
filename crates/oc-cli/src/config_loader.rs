@@ -145,4 +145,54 @@ abort_min_secs = 300
         assert_eq!(m.clamped_max_output_tokens(), 16_384);
         assert!(cfg.validate_shape().is_ok());
     }
+
+    /// 新增的 `[context]` 节能被真实解析路径接受（示例配置里就是这么写的）。
+    #[test]
+    fn context_section_parses() {
+        let toml_text = r#"proto_version = 1
+
+[server]
+transport = "pipe"
+
+[[models]]
+alias = "default"
+provider = "openai"
+model = "deepseek-chat"
+hosting = "cloud"
+base_url = "https://api.deepseek.com"
+api_key = { env = "DEEPSEEK_API_KEY" }
+
+[context]
+history_token_budget = 16384
+auto_compact = true
+
+[memory]
+vec = false
+halflife_days = 30
+trigger_threshold = 0.72
+trigger_max_per_turn = 3
+
+[proactive]
+heartbeat_secs = 60
+intent_cooldown_secs = 86400
+intent_budget = 3
+intent_expiry_days = 90
+
+[tools]
+exec_timeout_secs = 120
+[tools.approval]
+mode = "prompt"
+timeout_secs = 120
+
+[watchdog]
+idle_cloud_secs = 120
+idle_self_secs = 300
+run_timeout_secs = 0
+abort_min_secs = 300
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("含 [context] 的配置应可解析");
+        assert_eq!(cfg.context.history_token_budget, 16_384);
+        assert!(cfg.context.auto_compact);
+        assert!(cfg.validate_shape().is_ok());
+    }
 }

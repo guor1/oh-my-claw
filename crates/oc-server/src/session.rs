@@ -38,6 +38,8 @@ pub struct SessionConfig {
     pub max_history_entries: i64,
     /// 历史 token 预算（超出则丢弃更早的消息）。
     pub history_token_budget: i64,
+    /// 每轮结束后历史超预算水位时自动滚动摘要压缩（[context] 节）。
+    pub auto_compact: bool,
     /// SOUL.md 人格文本（每轮由 oc-core::prompt 确定性组装进系统提示词）。
     pub soul: String,
     /// 加载的技能文档（~/.oc/skills/*.md），确定性排序后注入 prompt（设计 §4.4）。
