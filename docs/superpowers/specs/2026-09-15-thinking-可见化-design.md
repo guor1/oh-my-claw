@@ -1,4 +1,4 @@
-# thinking 可见化 + 协议前向兼容 设计
+# thinking 实时可见化 设计
 
 日期：2026-09-15
 状态：已确认，待写实现计划
@@ -11,88 +11,61 @@ Web UI 发完消息后长时间没有任何中间状态。探查下来是**四�
 |---|---|---|---|
 | 1 | 模型输出思维链全程 | `oc-server/src/run.rs:591-595` | `Delta::Reasoning` 只累积，不推事件流 |
 | 2 | 点发送 → 第一个事件到达 | `oc-http/ui/src/components/ChatPane.vue:59-70` | 用户气泡之后不 push 任何占位 |
-| 3 | 全程 | `oc-http/ui/src/components/StatusBar.vue:34` | `status.active_run` 只在 ambient SSE 开场 snapshot 赋值一次（`native/events.rs:53`），之后只更新 Usage/Proactive/Task——这个「生成中」指示灯永远不亮 |
+| 3 | 全程 | `oc-http/ui/src/components/StatusBar.vue:34` | `status.active_run` 只在 ambient SSE 开场 snapshot 赋值一次（`native/events.rs:53`），之后只更新 Usage/Proactive/Task——这个「生成中」指示灯**永远不亮** |
 | 4 | 工具执行完 → 下一轮首 token | — | ToolCard 停在 ok 之后又是空白，多工具轮反复出现 |
 
-主力模型是 thinking 类，所以 1 是大头：模型在疯狂产出 reasoning token 的整段时间里，
+主力模型是 thinking 类，所以第 1 层是大头：模型在产出 reasoning token 的整段时间里，
 事件流上一个字节都没有。
 
-探查中发现一个**比 reasoning 更严重的问题**：
+### 一次 run 的真实结构
 
-- `Frame` / `Event` 都是 `#[serde(tag = "kind")]`，没有 `other` 兜底。
-- `oc-tui/src/client.rs:115` 的 `serde_json::from_str::<Frame>(t)?` 遇到不认识的帧
-  **直接抛错，整条连接断掉**。
-- `oc-http/src/conn_pool.rs:251-259` 则是宽容的（skip + warn，连接存活）。
+设计建立在这个结构上，先写清楚：
 
-也就是说**今天 daemon 只要加任何一个新 `Event` 变体，旧版 TUI 与任何第三方 client
-都会断连**。reasoning 只是第一个撞上这堵墙的特性。
+```
+run（用户的一次提问）
+└── step × N              ← 一次模型调用 = 一条 assistant 消息
+    ├── reasoning         为什么这么做
+    ├── content           说了什么      （可选）
+    └── tool_call         做了什么      （可选，最多 1 个）+ 它的结果
+```
 
-且 `ConnectParams { proto_version, token }` 只有版本号，**没有 client 能力声明**，
-daemon 无从知道对面认不认识新事件。
+依据：
+
+- `run.rs:518` 注释原话：「模型的输出有三个去处（**acc / reasoning / tc_args**）」——
+  一次模型流的三个 buffer。
+- `run.rs:151` 主循环每次迭代开头 `reasoning.clear()`——reasoning 的作用域就是这一轮。
+- `run.rs:258-268` 产生工具调用时，把本轮 reasoning 绑在**那条带 `tool_calls` 的
+  assistant 消息**上回喂；不带回去 DeepSeek 直接 400。**协议层面就规定了
+  reasoning 与 tool_calls 同属一条消息**。
+- `openai.rs:288`：「只取 `tool_calls[index=0]`：本轮架构一次执行一个工具」——
+  一步最多一个工具。
+
+所以 reasoning 与 tool_call **不是并列的两类事件**，而是同一条 assistant 消息的
+两个字段。最后一步没有工具调用，它的 action 就是产出最终回答。
 
 ## 目标
 
-1. thinking 模型的推理过程在 Web UI 与 TUI 上实时可见，消除第 1 层静默。
-2. 顺带消除第 2/3/4 层静默（纯前端）。
-3. 把「新增事件」从破坏性变更降级为兼容变更，让将来任何 app 接入都走同一套机制。
-4. 思维链可回看历史，但**绝不参与 prompt 重放**。
+1. thinking 模型的推理过程在 Web UI 与 TUI 上**实时**可见，消除第 1 层静默。
+2. 同一个组件顺带消除第 2、4 层静默；第 3 层单独修。
+3. 历史态与今天**逐字相同**——不为 thinking 留任何常驻结构。
 
 ## 非目标
 
-- 不改 OpenAI 兼容层（`/v1/responses`）。Responses 协议无对应事件，保持沉默是正确的。
+- **thinking 不落库**。不加迁移、不加列、不改 history 接口。
+- 不改 OpenAI 兼容层（`/v1/responses`）：Responses 协议无对应事件，保持沉默是正确的。
+- 不做 client 能力协商。项目未上生产，所有 client 都在本仓库内，一起改即可；
+  真要断代时 bump 已有的 `ConnectParams.proto_version`。
 - 不做 reasoning 事件合批/节流（理由见「决策记录」）。
-- 不把 thinking 塞进 TUI 消息流（理由见「决策记录」）。
 
 ## 设计
 
-### L1 — 前向兼容兜底
-
-`oc-tui/src/client.rs:115` 对齐 `conn_pool.rs` 已有的宽容策略：解不出的行 skip + warn，
-连接存活。
-
-兜底放在**解码层**，`Event` enum 不加 `Unknown` 变体——那会给每一处 match 增加一条
-永远走不到的分支，污染所有消费点。
-
-这一条独立成立：它是后面一切的地基，也应当作为协议的长期约定写进 `protocol.md`。
-
-### L2 — 能力协商
-
-`oc-proto/src/method.rs`：
-
-```rust
-pub struct ConnectParams {
-    pub proto_version: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// client 声明它能处理的**可选**事件类别。daemon 只推声明过的。
-    /// 缺省空 = 只收基础事件集，老 client 与第三方零改动继续工作。
-    #[serde(default)]
-    pub accepts: Vec<EventClass>,
-}
-
-/// 可选事件类别。基础集（Lifecycle / Assistant / Tool / Usage / Approval /
-/// UserInput / Proactive / Task）永远推送，不在此列。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum EventClass {
-    Reasoning,
-}
-```
-
-- daemon 在连接状态里记住 `accepts`，推可选事件前过滤。
-- 新 app 接入只需声明 `accepts: ["reasoning"]`，其余照旧。
-- 将来新增可选事件（token 级 usage、工具参数流式…）复用同一机制。
-
-`docs/reference/protocol.md` 需写清两件事：**基础集 vs 可选集的划分**，以及
-**「新增事件一律进可选集」**的约定。
-
-### L3 — 新事件 `Event::Reasoning`
+### A. 协议：新增 `Event::Reasoning`
 
 `oc-proto/src/event.rs`：
 
 ```rust
 /// thinking 模型的推理增量。与 Assistant 分开：它不是可见回答，
-/// client 应折叠 / 单行展示，且绝不参与下一轮 prompt 重放。
+/// 只供客户端实时展示，不落库、不参与 prompt 重放。
 Reasoning {
     session: SessionId,
     run_id: RunId,
@@ -106,105 +79,101 @@ Reasoning {
   `sink.rs` 当初把内联事件挪出广播的理由对它完全适用——**不能进 broadcast**。
 - `oc-http/src/native/chat.rs`：`belongs()` 加 run_id 匹配，`event_name()` 加 `"reasoning"`。
 - `oc-http/src/sse.rs` 不动，落 `_ => None`。
+- 加变体会让编译器报出所有 `Event` 消费点，逐一决定处理或忽略——这是想要的效果。
 
-加变体会让编译器把所有 `Event` 消费点报出来，逐一决定处理或忽略——这是想要的效果。
+`oc-server/src/session.rs:642` 的 `reasoning: None` 与其现有注释（「thinking 内容
+不落库，仅实时轮回喂」）**继续成立，一个字都不用改**。
 
-### L4 — 落库（v4 迁移）
+### B. Web UI：单例活动卡 `LiveActivity.vue`
 
-`oc-store/src/schema.rs`，沿用 V2/V3 的 `ALTER TABLE ADD COLUMN` 模式：
+**唯一的新渲染单元**，常驻消息流尾部，不进 `messageMap`（它不是消息）。
+状态机：
 
-```rust
-/// v4：thinking 模型的推理内容列。
-///
-/// 只服务 UI 回看，**不参与 prompt 重放**——见 `session.rs` 的 entry→Message 映射。
-pub const V4: &str = r#"
-ALTER TABLE entry ADD COLUMN reasoning TEXT;
-"#;
-```
+| 触发 | 形态 |
+|---|---|
+| 提交后立即 | `waiting`：「等待模型 · 3s」+ 计时 |
+| 收到 `reasoning` delta | `thinking`：「思考中 · 12s」+ 流式正文 |
+| 收到本 step 首个可见产物（`assistant` delta 或 `tool` start） | **隐藏** |
+| 工具执行中（start → end） | 保持隐藏（ToolCard 自带 running 指示） |
+| `tool` end 且 run 未结束 | 回到 `waiting` |
+| `lifecycle` end / error，或用户停止 | 隐藏并销毁 |
 
-- `NewEntry` / `Entry` 加 `reasoning: Option<String>`；run.rs 落 assistant 条目时写入
-  本轮累积值（只写产生它的那一条）。
-- `HistoryEntry`（`oc-proto/src/method.rs:275` 附近）加同名可选字段透传。对老 client
-  是新增字段，serde 默认忽略未知字段，安全。
-- **落库与 `accepts` 正交**：不声明 accepts 的 client 收不到实时事件，但历史照样存下，
-  换个 client 仍能回看。
+要点：
 
-**关键不变量**：`oc-server/src/session.rs:642` 的 `reasoning: None` **保持不变**。
-那行现有注释写的是「thinking 内容不落库，仅实时轮回喂」，本次改动后前半句不再成立，
-必须改成说明「**刻意不回喂**」——否则下一个读代码的人会把它当成遗漏而"修好"，
-直接把历史思维链灌进上下文。
+- **已完成的思考段不留痕**。不折叠成一行，不挂进 ToolCard，不进历史。切换 step 时
+  正文清空重来。因此不需要「这段思考属于哪一步」的归属建模。
+- **限高**：正文最多约 6 行，超出在卡内自动滚到底，不产生外层滚动条——
+  否则长思维链会把输入框顶出视口。
+- **展示开关**（localStorage）：关闭时卡**不消失**，退化为只有标题行与计时器，
+  不渲染正文。完全隐藏等于退回静默，那就白做了。
+- 计时器 1s tick，组件卸载时清理。
 
-### L5 — Web UI
+`loadHistory` 与 `MessageBubble` **不改**：历史里本就没有 thinking。
 
-新增 `ThinkingCard.vue`，消息模型加 `role: 'reasoning'`：
+### C. TUI：状态栏滚动
 
-- 首个 reasoning delta → push `{ role:'reasoning', content:'', pending:true, startedAt }`。
-- 后续 delta 追加。
-- **定格条件**（`pending=false` + 自动折叠成一行「思考 18s」，可点开）：收到本轮的
-  首个 `assistant` delta、**或**首个 `tool` start、**或** `lifecycle` end/error —— 三者
-  取最先到达者。只认 assistant delta 是不够的：纯工具轮不产出可见文本，卡会永远
-  停在 pending。
-- `loadHistory`：带 `reasoning` 的 assistant 条目前插一条**已折叠**的卡。
-- 展示开关存 localStorage，关掉时不渲染卡（事件照收），切换即时生效。
+`oc-tui/src/app.rs`，与 B 同构——瞬时、单例、不留痕：
 
-同时消除另外三层静默：
-
-- **占位**：submit 后立刻挂一条 `role:'waiting'` 卡（「等待模型 · 3s」+ 计时）。
-  它与 ThinkingCard 是**两个独立组件**：收到首个 reasoning delta 时移除 waiting 卡、
-  建 ThinkingCard；若首个到达的是 assistant/tool 事件（非 thinking 模型），
-  直接移除 waiting 卡。
-- **工具后空档**：ToolCard 收到 `end` 且本轮未结束（未收到 lifecycle end/error）
-  → 重新挂 waiting 卡。
-- **StatusBar**：`active_run` 改为从 `activeChats` 派生（`isStreaming` 已存在），
-  不再依赖那个永不更新的 snapshot 字段。
-
-### L6 — TUI 状态栏滚动
-
-`oc-tui/src/app.rs`：
-
-- `App` 加 `reasoning_tail: String` 与 `show_reasoning: bool`。tail 有界：保留末尾
-  512 字符（状态栏最多用掉一行，多留的部分只为窄窗口下不至于截空）。
-- 收到 `Event::Reasoning` → 换行压成空格后追加，超过上限从**头部**丢弃。
-- `draw()` 的 `chunks[2]` 状态栏：thinking 活跃时渲染 `💭 <tail>`，按状态栏剩余宽度
+- `App` 加 `reasoning_tail: String` 与 `show_reasoning: bool`。tail 保留末尾 512 字符
+  （状态栏最多用掉一行，多留只为窄窗口下不至于截空）。
+- 收到 `Event::Reasoning` → 换行压成空格后追加，超上限从**头部**丢弃。
+- `draw()` 的 `chunks[2]`：thinking 活跃时渲染 `💭 <tail>`，按状态栏剩余宽度
   **从右往左**取能放下的部分。delta 持续追加天然形成左滚，**不需要动画定时器**。
-  中文双宽要按**显示列宽**算，不能按字符数。
-- 首个 Assistant delta 或 `Lifecycle::End` / `Error` → 清空 tail，恢复原状态文本。
-- 键位切换 `show_reasoning`。关掉只是不渲染，`accepts` 仍声明——**连接级能力与
-  展示偏好分离**。
+  中文双宽按**显示列宽**算，不能按字符数。
+- 首个 Assistant delta / Tool start / `Lifecycle::End|Error` → 清空 tail，恢复原状态文本。
+- 键位切换 `show_reasoning`（仅控制渲染）。
+
+### D. StatusBar 死指示灯
+
+`StatusBar.vue:34` 的 `active_run` 改为从 `activeChats` 派生（`ChatPane` 里的
+`isStreaming` 已经是这个语义），不再依赖那个永不更新的 snapshot 字段。
+
+### E. 解码层兜底
+
+`oc-tui/src/client.rs:115` 的 `serde_json::from_str::<Frame>(t)?` 遇到不认识的帧会
+**抛错断连**；`oc-http/src/conn_pool.rs:251-259` 则是 skip + warn。把 TUI 对齐到宽容策略。
+
+不是为了版本兼容（本项目不考虑），而是「一条脏行不该杀掉整条连接」。顺手做，
+与 A 同一个提交。
 
 ## 实施顺序
 
 ```
-L1 → L2 → L3 → L4 → (L5 ∥ L6)
+A（含 E） → (B ∥ C ∥ D)
 ```
 
-L1 / L2 是地基且能独立验证；L3 之后 Web 与 TUI 可并行。
+A 落地后 Web / TUI / StatusBar 三件事互不依赖，可并行。
 
 ## 测试要点
 
-- **L1**：喂一行伪造的未知 `kind` 事件，断言 TUI client 跳过该行且连接存活。
-- **L2**：不声明 `accepts` 的连接收不到 `Reasoning`；声明了的收得到。
-- **L3**：mock provider 产出 `Delta::Reasoning`，断言事件流上出现 `Reasoning`，
-  且同轮回喂的 `Message.reasoning` 仍被正确带回（回归保护）。
-- **L4**：v3 库跑迁移到 v4，既有行 `reasoning` 为 NULL；
-  **历史重放构造的 `Message.reasoning` 恒为 `None`**——这条断言是防回归的核心。
-- **L6**：含中文的 tail 按显示列宽截断，不出现半个字符或越界。
+- **A**：mock provider 产出 `Delta::Reasoning`，断言事件流上出现 `Reasoning`；
+  且同轮回喂的 `Message.reasoning` 仍被正确带回（**回归保护**：
+  `run.rs:264` 那段不能被改坏，否则 DeepSeek 400）。
+- **A**：`Reasoning` 事件不出现在 `/v1/responses` 的 SSE 输出里。
+- **B**：状态机六条迁移各一例；尤其「tool end 后回到 waiting」与
+  「lifecycle end 后销毁」。
+- **B**：`loadHistory` 的产物不含任何 thinking 单元。
+- **C**：含中文的 tail 按显示列宽截断，不出现半个字符或越界。
+- **E**：喂一行伪造的未知 `kind` 帧，断言 TUI client 跳过该行且连接存活。
 
 ## 决策记录
 
-**为什么开关放纯客户端？**
-L2 已经回答了「这个 client 认不认识 reasoning」，L3 的开关只管「此刻用户想不想看」。
-daemon 按 `accepts` 持续推，各 client 自存偏好：切换即时生效、零协议往返，
-loopback 带宽不是问题。将来远程接入若在意带宽，再加 `ChatSendParams.stream_reasoning`
-的 per-turn override——L2 机制已就位，那时是小改。
+**为什么 thinking 不落库、不留痕？**
+落库要动 schema、history 接口，并引入「截断续写时多轮 reasoning 怎么合并」的新问题
+（`run.rs:151` 每轮清零，`run.rs:192` 已论证被砍断的 reasoning 连回喂价值都没有）。
+而它的全部价值在**运行中告诉用户"还活着、在想什么"**，事后回看的价值很低。
+不留痕还顺带消掉了「思考归属哪一步」的整套建模——收益/代价严重不对称。
+代价明确：思考看过就没了，卡片消失后无法回看。
+
+**为什么是一张单例活动卡，而不是每段思考一张卡？**
+每段一张卡就必须回答「它属于哪一步、历史里怎么显示、折叠态什么样」；
+单例卡把这些问题全部消除，且天然覆盖第 2、4 层静默——等待与思考本来就是
+同一件事的两个阶段。
+
+**为什么开关关闭时卡不消失？**
+开关管的是「要不要看思维链内容」，不是「要不要知道模型在动」。
+完全隐藏就退回静默了。
 
 **为什么不合批 reasoning 事件？**
 思维链 delta 密集，但与 Assistant delta 同频、同通道、同背压机制，现状已扛住。
 先按原样逐条发，实测有压力再加节流——过早优化会把一个简单分支变成状态机。
-
-**为什么 TUI 的 thinking 只进状态栏？**
-消息流是对话记录，思维链是过程噪音。且 TUI 没有折叠能力，塞进消息流会把历史冲掉。
-
-**为什么兜底放解码层而不是 `Event::Unknown`？**
-`Unknown` 变体会给每一处 `match` 增加一条永远走不到的分支，污染所有消费点；
-而解码层兜底只需两个 client 各改一处。
