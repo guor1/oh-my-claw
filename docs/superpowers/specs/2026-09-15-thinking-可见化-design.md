@@ -174,13 +174,62 @@ Web UI 自身有 `isStreaming` 守卫不能并发提交，只有 TUI / 其他 cl
 不是为了版本兼容（本项目不考虑），而是「一条脏行不该杀掉整条连接」。顺手做，
 与 A 同一个提交。
 
+### F. 第三方 / app 客户端如何接入
+
+本仓库之外的客户端（将来的移动端、桌面端）走 **native HTTP API**，不是 socket——
+socket 只在本机。`oc http --bind <非 loopback> --token <t>` 即可对外提供；
+绑定非 loopback 地址时 token 是**强制**的（`auth.rs::check_bind_requires_token`，
+在建 socket 之前就校验，配错直接启动失败）。
+
+**线上格式。** `Event` 是 `#[serde(tag = "event", rename_all = "snake_case")]`，
+外层 `Frame` 是 `tag = "kind"`。所以：
+
+```
+# NDJSON（socket，本机客户端如 TUI）
+{"kind":"event","event":"reasoning","session":"main","run_id":"...","delta":"我需要先确认"}
+
+# HTTP SSE（POST /api/v1/chat/send 的响应体）
+event: reasoning
+data: {"event":"reasoning","session":"main","run_id":"...","delta":"我需要先确认"}
+```
+
+**接入步骤**（约等于 `ui/src/lib/api.js` 的 `sendChat`）：
+
+1. `POST /api/v1/chat/send`，带 `Authorization: Bearer <token>`、
+   `Accept: text/event-stream`，body `{"session": "...", "text": "..."}`。
+2. 按 SSE 的 `event:` 名分发：`accepted` / `reasoning` / `assistant` / `tool` /
+   `approval` / `user_input` / `lifecycle`。
+3. **忽略不认识的 `event:` 名**。前向兼容的义务在客户端侧——服务端不做能力协商
+   （见「非目标」），新增事件不会事先通知。这条不做，将来加事件就会打断你。
+
+**四条语义契约**，app 实现前必须知道：
+
+- **reasoning 只在 `chat/send` 的 POST 响应里，不在 `GET /api/v1/events` 上。**
+  它是 run 的内联事件，经 `RunSink::Conn` 直达发起该 turn 的连接，从不进全局广播；
+  ambient 流只有 `Usage` / `Proactive` / `Task`（见 `native/mod.rs` 的模块文档）。
+  这是最容易踩的坑——以为订阅了 events 就能收到，结果永远收不到。
+- **一个 run 内有多段 reasoning，每个 step 一段，且没有显式的段起止标记。**
+  段边界由「本 step 首个其他事件到达」隐式给出（`assistant` delta 或 `tool` start）。
+  同一 run 的事件走同一条有序通道，顺序有保证，所以这条规则对所有客户端一致。
+  想按 step 分段展示的客户端据此切分；本仓库的 Web/TUI 选择不留痕，所以直接清空。
+- **非 thinking 模型永远不发 reasoning。** 不能假设它一定出现，UI 必须在没有它的
+  情况下也说得通。
+- **不落库。** `GET /api/v1/sessions/:id/history` 里没有 reasoning，永远不会有。
+  它是瞬时的，错过就没了。
+
+**OpenAI 兼容端点 `/v1/responses` 不提供 thinking**——Responses 协议没有对应事件。
+需要 thinking 的客户端必须走 native API。
+
+`docs/reference/protocol.md` 要把以上写进去，这是对外的唯一契约来源。
+
 ## 实施顺序
 
 ```
-A（含 E） → (B ∥ C ∥ D)
+A（含 E） → (B ∥ C ∥ D) → F
 ```
 
 A 落地后 Web / TUI / StatusBar 三件事互不依赖，可并行。
+F（`protocol.md` 文档）放最后，等实际线上格式跑通了再落笔，避免文档与实现对不上。
 
 ## 测试要点
 
@@ -198,6 +247,10 @@ A 落地后 Web / TUI / StatusBar 三件事互不依赖，可并行。
 - **B**：`loadHistory` 的产物不含任何 thinking 单元。
 - **C**：含中文的 tail 按显示列宽截断，不出现半个字符或越界。
 - **E**：喂一行伪造的未知 `kind` 帧，断言 TUI client 跳过该行且连接存活。
+- **F**：`GET /api/v1/events`（ambient 流）**不**出现 `reasoning`——
+  它是内联事件，只在 `chat/send` 的响应上。这条锁住文档里那个「最容易踩的坑」。
+- **F**：SSE 线上格式断言 `event: reasoning` 与 data 里的 `"event":"reasoning"`，
+  防止将来改 serde 标签时无声破坏外部客户端。
 
 ## 决策记录
 
