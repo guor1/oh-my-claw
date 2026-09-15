@@ -62,6 +62,9 @@ oc http [--port 8080] [--socket <路径>] [--max-conns 32]
 绑定 `127.0.0.1`，**没有认证**。
 
 这是单用户本地 daemon 的设计前提。不要暴露到公网或放在反向代理后面——任何能访问该端口的进程都能以你的身份对话、跑工具、读写你的记忆。
+
+---
+
 ## 第三方 / app 客户端接入 thinking
 
 本仓库之外的客户端走 **native HTTP API**（`/api/v1/*`），不是 socket——socket 只在本机。
@@ -85,7 +88,8 @@ oc http [--port 8080] [--socket <路径>] [--max-conns 32]
 1. `POST /api/v1/chat/send`，带 `Authorization: Bearer <token>`、
    `Accept: text/event-stream`，body `{"session":"...","text":"..."}`。
 2. 按 SSE 的 `event:` 名分发：`accepted` / `reasoning` / `assistant` / `tool` /
-   `approval` / `user_input` / `lifecycle`。
+   `approval` / `user_input` / `lifecycle`。`usage` 也会出现在这条流上（按 session
+   归属，非 run 内联），一并忽略或消费皆可。
 3. **忽略不认识的 `event:` 名**——前向兼容的义务在客户端侧，服务端不做能力协商，
    新增事件不会事先通知。
 
