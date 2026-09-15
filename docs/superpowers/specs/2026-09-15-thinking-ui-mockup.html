@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LiveActivity：单例活动卡（定案效果图）</title>
+<style>
+/* ── Tokens：逐字抄自 ui/src/App.vue ── */
+:root {
+  --n-0:  hsl(220 15% 97%);
+  --n-1:  hsl(220 12% 93%);
+  --n-2:  hsl(220 10% 86%);
+  --n-3:  hsl(220  9% 74%);
+  --n-4:  hsl(220  8% 58%);
+  --n-5:  hsl(220  7% 42%);
+  --n-6:  hsl(220  8% 28%);
+  --n-7:  hsl(220  9% 20%);
+  --n-8:  hsl(220 10% 14%);
+  --n-9:  hsl(220 12% 10%);
+
+  --accent-h: 218;
+  --accent:       hsl(var(--accent-h) 80% 52%);
+  --accent-hover: hsl(var(--accent-h) 80% 44%);
+  --accent-muted: hsl(var(--accent-h) 60% 70%);
+  --accent-bg:    hsl(var(--accent-h) 80% 96%);
+
+  --success: hsl(150 60% 38%);
+  --danger:  hsl(  2 70% 50%);
+  --warn:    hsl( 38 90% 46%);
+
+  --surface:        var(--n-0);
+  --surface-raised: white;
+  --border:         var(--n-2);
+  --text:           hsl(220 12% 13%);
+  --text-muted:     var(--n-4);
+
+  --r-sm: 4px; --r-md: 8px;
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;
+  --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: var(--n-8); --surface-raised: var(--n-7);
+    --border: var(--n-6); --text: var(--n-0); --text-muted: var(--n-3);
+    --accent: hsl(var(--accent-h) 65% 62%);
+    --accent-hover: hsl(var(--accent-h) 65% 70%);
+    --accent-muted: hsl(var(--accent-h) 45% 50%);
+    --accent-bg: hsl(var(--accent-h) 30% 18%);
+  }
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px; line-height: 1.6;
+  background: var(--surface); color: var(--text); min-height: 100dvh;
+}
+button { font: inherit; cursor: pointer; border: none; background: none; color: inherit; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ── 外壳 ── */
+.shell { max-width: 1180px; margin: 0 auto; padding: var(--sp-5) var(--sp-5) var(--sp-6); }
+.shell-head h1 { font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
+.shell-head p { color: var(--text-muted); font-size: 13px; margin-top: var(--sp-1); max-width: 78ch; }
+.shell-head code { font-family: ui-monospace, monospace; font-size: 12px; }
+
+h2.sec {
+  font-size: 13px; font-weight: 700; letter-spacing: .06em;
+  color: var(--text-muted); text-transform: uppercase;
+  margin: var(--sp-6) 0 var(--sp-3);
+}
+
+.controls {
+  display: flex; flex-wrap: wrap; gap: var(--sp-4); align-items: center;
+  margin: var(--sp-4) 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface-raised);
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  position: sticky; top: 0; z-index: 10;
+}
+.btn {
+  padding: 5px 14px; border-radius: var(--r-sm);
+  background: var(--accent); color: white; font-size: 13px; font-weight: 500;
+  transition: background 120ms;
+}
+.btn:hover { background: var(--accent-hover); }
+.btn.ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+.btn.ghost:hover { color: var(--text); border-color: var(--accent-muted); }
+.seg { display: flex; border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
+.seg button { padding: 5px 11px; font-size: 13px; color: var(--text-muted); }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: white; }
+.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); cursor: pointer; }
+.check input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+.ctl-label { font-size: 12px; font-weight: 600; color: var(--text-muted); letter-spacing: .04em; }
+
+/* ── 聊天面板 ── */
+.pane {
+  background: var(--surface-raised);
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.pane-head {
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--n-2) 25%, transparent);
+  display: flex; align-items: center; gap: var(--sp-2);
+  font-size: 13px; font-weight: 600;
+}
+.phase-chip {
+  margin-left: auto; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  padding: 1px 8px; border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.messages {
+  padding: var(--sp-4);
+  display: flex; flex-direction: column; gap: var(--sp-3);
+  background: var(--surface);
+  min-height: 460px;
+}
+.composer {
+  display: flex; gap: var(--sp-2); align-items: center;
+  padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--border); background: var(--surface-raised);
+}
+.composer .fake-input {
+  flex: 1; padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  color: var(--text-muted); font-size: 13px; background: var(--surface);
+}
+.composer .fake-btn {
+  padding: var(--sp-2) var(--sp-4); border-radius: var(--r-md);
+  background: var(--accent); color: white; font-size: 13px;
+}
+.composer .fake-btn.stop { background: var(--danger); }
+
+/* ── 气泡 ── */
+.bubble-row { display: flex; justify-content: flex-start; }
+.bubble-row.user { justify-content: flex-end; }
+.bubble {
+  min-width: 0; max-width: min(72ch, 92%);
+  padding: var(--sp-2) var(--sp-3); border-radius: var(--r-md); font-size: 14px;
+}
+.bubble.user {
+  max-width: min(60ch, 80%); background: var(--accent); color: white;
+  border-bottom-right-radius: var(--r-sm);
+}
+.bubble.assistant {
+  max-width: min(840px, 100%); background: var(--surface-raised);
+  border: 1px solid var(--border); border-bottom-left-radius: var(--r-sm);
+}
+.bubble.assistant code {
+  font-family: ui-monospace, "Cascadia Code", monospace; font-size: 12px;
+  background: color-mix(in srgb, var(--n-2) 45%, transparent);
+  padding: 1px 4px; border-radius: 3px;
+}
+
+/* ── 工具行：抄自 ToolCard.vue，本方案不作任何改动 ── */
+.tool-row {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 4px 8px; border-radius: var(--r-sm);
+  background: transparent; color: var(--text-muted);
+  font-size: 13px; line-height: 1.5; text-align: left;
+  transition: background 150ms, color 150ms;
+}
+.tool-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--text); }
+.chev {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 9px; font-size: 12px; flex-shrink: 0;
+  color: var(--text-muted); opacity: .7; transition: transform 150ms;
+}
+.tool-row[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.ico { display: inline-flex; align-items: center; justify-content: center; width: 15px; flex-shrink: 0; }
+.verb { flex-shrink: 0; font-weight: 500; color: var(--text); }
+.target {
+  flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 12px; font-weight: 500; color: var(--text);
+}
+.tool-spinner {
+  flex-shrink: 0; margin-left: auto;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); animation: pulse 1.1s ease-in-out infinite;
+}
+.is-running .ico { color: var(--accent); }
+.tool-body { padding: 2px 8px 8px 24px; }
+.kv { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 13px; line-height: 1.6; }
+.kv-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.kv-key { flex-shrink: 0; font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-muted); }
+.kv-val { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
+.out-label {
+  display: inline-block; margin: 8px 0 4px;
+  font-size: 11px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--text-muted);
+}
+.out-content {
+  margin: 0; padding: 10px 12px; border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--n-2) 55%, transparent);
+  color: var(--text); font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+@keyframes pulse { 0%,100% { opacity:.35; transform: scale(.85) } 50% { opacity:1; transform: scale(1) } }
+
+/* ══════════════════════════════════════════════════════════
+   LiveActivity —— 本方案唯一的新渲染单元
+   单例 · 常驻流尾 · 不进 messageMap · 不落库 · 不留痕
+   ══════════════════════════════════════════════════════════ */
+.live {
+  border: 1px dashed color-mix(in srgb, var(--accent) 38%, var(--border));
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  padding: var(--sp-2) var(--sp-3);
+  align-self: stretch;
+}
+.live[hidden] { display: none; }
+
+.live-head {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; font-weight: 600; color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.live-head .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; animation: pulse 1.1s ease-in-out infinite;
+}
+.live-body {
+  margin-top: 4px;
+  font-size: 13px; line-height: 1.7; color: var(--text-muted);
+  /* 限高：最多约 6 行，超出在卡内自动滚到底，不产生外层滚动条 */
+  max-height: calc(1.7em * 6);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.live-body::-webkit-scrollbar { width: 4px; }
+.live-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.live-body[hidden] { display: none; }
+
+.caret {
+  display: inline-block; width: 2px; height: 1em;
+  vertical-align: text-bottom; background: var(--accent);
+  animation: blink .9s step-end infinite;
+}
+@keyframes blink { 0%,100% { opacity:1 } 50% { opacity:0 } }
+
+/* waiting 态：无正文，色调更沉，与 thinking 一眼可分 */
+.live.waiting {
+  border-style: solid;
+  border-color: var(--border);
+  background: transparent;
+}
+.live.waiting .live-head { color: var(--text-muted); font-weight: 500; }
+
+/* ── 状态定格 ── */
+.frames { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: var(--sp-4); }
+.frame {
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface-raised); overflow: hidden;
+}
+.frame-head {
+  padding: 6px var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--n-2) 25%, transparent);
+  font-size: 12px; font-weight: 600;
+  display: flex; align-items: baseline; gap: var(--sp-2);
+}
+.frame-head em { font-style: normal; font-weight: 400; color: var(--text-muted); font-size: 11px; margin-left: auto; }
+.frame-body { padding: var(--sp-3); background: var(--surface); }
+
+/* ── 状态机表 ── */
+.fsm {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden;
+}
+.fsm th, .fsm td { padding: 7px var(--sp-3); text-align: left; border-bottom: 1px solid var(--border); }
+.fsm th { font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--text-muted); background: color-mix(in srgb, var(--n-2) 25%, transparent); }
+.fsm tr:last-child td { border-bottom: none; }
+.fsm tr.active td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.fsm code { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text); }
+.fsm .st { font-weight: 600; }
+.fsm .st.wait  { color: var(--text-muted); }
+.fsm .st.think { color: var(--accent); }
+.fsm .st.gone  { color: var(--success); }
+
+.hint {
+  margin-top: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  font-size: 13px; color: var(--text-muted);
+}
+.hint code { font-family: ui-monospace, monospace; font-size: 12px; }
+
+@media (max-width: 880px) { .frames { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <div class="shell-head">
+    <h1>LiveActivity：单例活动卡</h1>
+    <p>
+      本方案<strong>唯一的新渲染单元</strong>。它常驻消息流尾部，不进 <code>messageMap</code>（它不是消息），
+      不落库、不留痕——已完成的思考段直接消失。工具卡与气泡<strong>一行都没改</strong>。
+      按 ▶ 看它在一次完整 run 里的进出。
+    </p>
+  </div>
+
+  <div class="controls">
+    <button class="btn" id="btn-play">▶ 重播</button>
+    <button class="btn ghost" id="btn-pause">⏸ 暂停</button>
+    <div class="ctl-group" style="display:flex;align-items:center;gap:8px">
+      <span class="ctl-label">速度</span>
+      <div class="seg" id="seg-speed">
+        <button data-speed="0.5" aria-pressed="false">0.5×</button>
+        <button data-speed="1"   aria-pressed="true">1×</button>
+        <button data-speed="2"   aria-pressed="false">2×</button>
+      </div>
+    </div>
+    <div class="ctl-group" style="display:flex;align-items:center;gap:8px">
+      <span class="ctl-label">waiting 阈值</span>
+      <div class="seg" id="seg-thr">
+        <button data-thr="0"    aria-pressed="false">0ms（不延迟）</button>
+        <button data-thr="400"  aria-pressed="true">400ms</button>
+        <button data-thr="1200" aria-pressed="false">1200ms</button>
+      </div>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="chk-show" checked>
+      显示思考内容（用户开关）
+    </label>
+    <button class="btn ghost" id="btn-reload">看「刷新后」的样子</button>
+  </div>
+
+  <section class="pane">
+    <header class="pane-head">
+      <span>main</span>
+      <span class="phase-chip" id="phase">idle</span>
+    </header>
+    <div class="messages" id="messages"></div>
+    <div class="composer">
+      <div class="fake-input">说点什么…</div>
+      <div class="fake-btn" id="fake-btn">发送</div>
+    </div>
+  </section>
+
+  <h2 class="sec">状态机</h2>
+  <table class="fsm" id="fsm">
+    <thead><tr><th style="width:44%">触发</th><th>卡的形态</th></tr></thead>
+    <tbody>
+      <tr data-st="waiting"><td>提交后 / 工具结束后，空窗<strong>超过阈值</strong></td><td><span class="st wait">waiting</span> · 「等待模型 · <em>N</em>s」，无正文。空窗短于阈值则<strong>根本不出现</strong></td></tr>
+      <tr data-st="thinking"><td>收到 <code>reasoning</code> delta</td><td><span class="st think">thinking</span> · 「思考中 · <em>N</em>s」+ 流式正文（不延迟）</td></tr>
+      <tr data-st="hidden-visible"><td>收到本 step 首个可见产物（<code>assistant</code> delta 或 <code>tool</code> start）</td><td><span class="st gone">隐藏</span>，并取消未触发的延迟定时器</td></tr>
+      <tr data-st="hidden-tool"><td>工具执行中（start → end）</td><td><span class="st gone">保持隐藏</span>（ToolCard 自带 running 指示）</td></tr>
+      <tr data-st="back-wait"><td><code>tool</code> end 且 run 未结束</td><td>回到 <span class="st wait">waiting</span>（同样走延迟）</td></tr>
+      <tr data-st="destroy"><td><code>lifecycle</code> end / error，或用户停止</td><td><span class="st gone">隐藏并销毁</span></td></tr>
+    </tbody>
+  </table>
+
+  <h2 class="sec">状态定格</h2>
+  <div class="frames" id="frames"></div>
+
+  <div class="hint">
+    <strong>waiting 为什么要延迟出现</strong>：空窗常常只有几百毫秒，立刻渲染会让卡闪一下就换成
+    thinking，纯属噪音。剧本里第三次空窗刻意只有 <strong>260ms</strong>——用 400ms 阈值播放时
+    waiting 会被<strong>整个跳过</strong>，卡直接以 thinking 形态出场（注意看右上角 chip 的提示）。
+    把阈值切到 <strong>0ms</strong> 重播，就能看到不加延迟时那一下刺眼的闪烁。
+  </div>
+  <div class="hint">
+    <strong>waiting 修的不是 thinking 的静默</strong>，是首 token 前的空窗（第 2、4 层）。
+    更硬的理由：<strong>非 thinking 模型根本不产生 reasoning delta</strong>，对它们来说 waiting 是
+    这张卡唯一会出现的形态。计时口径也因此要从<strong>空窗起点</strong>算，不是从卡出现时刻算，
+    否则显示的秒数会比真实等待短一个阈值。
+  </div>
+  <div class="hint">
+    <strong>为什么不留痕</strong>：已完成的思考段不折叠成一行、不挂进 ToolCard、不进历史。
+    于是「这段思考属于哪一步」这个建模问题<strong>整个消失</strong>——而它正是前几版设计卡住的地方。
+    代价也说清楚：<strong>思考看过就没了</strong>，卡片消失后无法回看。
+  </div>
+  <div class="hint">
+    <strong>开关关闭时卡不消失</strong>，只退化成标题行 + 计时器。开关管的是「要不要看思维链内容」，
+    不是「要不要知道模型在动」——完全隐藏就退回静默了。取消上面的勾选，重播一次即可看到。
+  </div>
+  <div class="hint">
+    <strong>「刷新后」= 今天</strong>。thinking 不落库，历史里本就没有它，而本方案没为它留任何常驻结构。
+    点上面那个按钮对比：画面与现在的 UI 逐字相同。
+  </div>
+
+</div>
+
+<script>
+/* ══ 剧本：一次带 3 个工具轮的 thinking 模型 run ══════════════ */
+
+const USER = '写一个文件';
+
+const ANSWER = '已经把相声《我和AI搭伙》保存为文件了，路径是：\n' +
+  '⟪C:\\Users\\guorui1\\.oc\\workspace\\我和AI搭伙.md⟫\n' +
+  '需要修改内容或者调整格式随时说。';
+
+const SCRIPT = [
+  { t: 'user',    text: USER },
+  { t: 'waiting', ms: 1500 },
+  { t: 'think',   text: '用户只说"写一个文件"，没给文件名、内容和路径。上一轮刚写过相声《我和AI搭伙》，多半是要把那个存下来——但这是我的推测，不该替他做决定。先把三件事问清楚：文件名、保存路径、内容取哪一段。' },
+  { t: 'tool',    runMs: 1100, tool: {
+      icon: '❓', verb: '提问',
+      target: '请问你要写的文件：1. 文件名是什么？2. 要保存到哪个路径（默认当前目录也可以说）？3…',
+      kv: { prompt: '请问你要写的文件：1. 文件名是什么？2. 要保存到哪个路径？3. 内容是刚才那段相声吗？' },
+      out: '（用户未逐条回答，直接说"写一个文件"）' } },
+
+  { t: 'waiting', ms: 1000 },
+  /* 这一段刻意写长，用来演示限高 6 行 + 卡内自动滚底 */
+  { t: 'think',   text: '用户没有逐条回答，那就按最合理的默认来，别再追问第二轮惹人烦。文件名取相声标题《我和AI搭伙》，扩展名用 .md——正文有标题层级和对白结构，markdown 是最自然的载体，而且他后面大概率还要改，纯文本比 docx 好编辑得多。路径先按当前工作目录，不擅自往桌面或文档目录塞。内容直接取上一轮生成的那段完整相声，不做删改，格式上把角色名加粗、每段对白独立成行，方便他直接拿去排练。' },
+  { t: 'tool',    runMs: 1000, tool: {
+      icon: '📝', verb: '写入', target: '我和AI搭伙.md',
+      kv: { path: '我和AI搭伙.md', bytes: '3.2 KB' },
+      out: '已写入 我和AI搭伙.md（3276 字节）' } },
+
+  /* 这一次空窗很短（260ms），演示未达阈值时 waiting 根本不出现 */
+  { t: 'waiting', ms: 260 },
+  { t: 'think',   text: '写成功了，但我手上只有相对文件名。用户要的是"文件在哪"，只说"写好了"等于没说——得先拿到当前工作目录，才能给出他能直接复制去粘贴的绝对路径。' },
+  { t: 'tool',    runMs: 800, tool: {
+      icon: '📍', verb: '当前目录', kv: {},
+      out: 'C:\\Users\\guorui1\\.oc\\workspace' } },
+
+  { t: 'waiting', ms: 1000 },
+  { t: 'think',   text: '路径拼出来了。回答里要把绝对路径单独用代码块标出来方便复制，再补一句"要改随时说"——他刚才连续两轮都在迭代这个相声，大概率还会改。' },
+  { t: 'answer',  text: ANSWER },
+  { t: 'end' },
+];
+
+/* ══ DOM ══════════════════════════════════════════════════ */
+
+const $msgs   = document.getElementById('messages');
+const $phase  = document.getElementById('phase');
+const $fakeBtn= document.getElementById('fake-btn');
+const $fsm    = document.getElementById('fsm');
+
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+/* 单例活动卡 */
+let card, cardHead, cardBody, cardTimer = null, cardSince = 0;
+
+function buildCard() {
+  card = document.createElement('div');
+  card.className = 'live';
+  card.hidden = true;
+  card.innerHTML = `
+    <div class="live-head"><span class="dot"></span><span data-label></span></div>
+    <div class="live-body" hidden><span data-text></span><span class="caret"></span></div>`;
+  cardHead = card.querySelector('[data-label]');
+  cardBody = card.querySelector('.live-body');
+}
+
+function cardShow(mode, since) {   // mode: 'waiting' | 'thinking'
+  card.hidden = false;
+  card.classList.toggle('waiting', mode === 'waiting');
+  const showText = mode === 'thinking' && document.getElementById('chk-show').checked;
+  cardBody.hidden = !showText;
+  if (mode === 'thinking') cardBody.querySelector('[data-text]').textContent = '';
+  // 计时口径：waiting 从本次空窗开始计（不是从卡出现时刻），否则显示的秒数
+  // 比真实等待短一个阈值；thinking 从本 step 首个 reasoning delta 计。
+  cardSince = since ?? Date.now();
+  tickCard(mode);
+  clearInterval(cardTimer);
+  cardTimer = setInterval(() => tickCard(mode), 250);
+  $msgs.appendChild(card);                 // 永远待在流尾
+  scrollBottom();
+}
+
+function tickCard(mode) {
+  const s = Math.floor((Date.now() - cardSince) / 1000);
+  cardHead.textContent = mode === 'waiting'
+    ? `等待模型 · ${s}s`
+    : `💭 思考中 · ${s}s`;
+}
+
+function cardHide() {
+  card.hidden = true;
+  clearInterval(cardTimer);
+  cardTimer = null;
+}
+
+function scrollBottom() { $msgs.scrollTop = $msgs.scrollHeight; }
+
+/* ══ 渲染片段 ══════════════════════════════════════════════ */
+
+function addUser(text) {
+  const el = document.createElement('div');
+  el.className = 'bubble-row user';
+  el.innerHTML = `<div class="bubble user">${esc(text)}</div>`;
+  $msgs.appendChild(el);
+}
+
+function addTool(t) {
+  const kv = Object.entries(t.kv || {});
+  const el = document.createElement('div');
+  el.className = 'is-running';
+  el.innerHTML = `
+    <button class="tool-row" aria-expanded="false" data-toggle>
+      <span class="chev">▸</span><span class="ico">${t.icon}</span>
+      <span class="verb">${esc(t.verb)}</span>
+      ${t.target ? `<span class="target">${esc(t.target)}</span>` : ''}
+      <span class="tool-spinner"></span>
+    </button>
+    <div class="tool-body" hidden>
+      ${kv.length ? `<div class="kv">${kv.map(([k,v]) =>
+        `<div class="kv-row"><span class="kv-key">${esc(k)}:</span><span class="kv-val">${esc(v)}</span></div>`
+      ).join('')}</div>` : ''}
+      ${t.out ? `<span class="out-label">输出</span><pre class="out-content">${esc(t.out)}</pre>` : ''}
+    </div>`;
+  $msgs.appendChild(el);
+  return el;
+}
+
+function finishTool(el) {
+  el.classList.remove('is-running');
+  el.querySelector('.tool-spinner')?.remove();
+}
+
+function addAnswer() {
+  const el = document.createElement('div');
+  el.className = 'bubble-row';
+  el.innerHTML = `<div class="bubble assistant"><span data-answer></span><span class="caret"></span></div>`;
+  $msgs.appendChild(el);
+  return el;
+}
+
+/* ⟪…⟫ 标记渲染成 <code> */
+function answerHtml(text) {
+  return esc(text)
+    .replace(/⟪([^⟫]*)⟫/g, (_, c) => `<code>${c}</code>`)
+    .replace(/\n/g, '<br>');
+}
+
+/* ══ 播放引擎 ══════════════════════════════════════════════ */
+
+let token = 0, paused = false, speed = 1, threshold = 400;
+
+const sleep = (ms, alive) => new Promise(res => {
+  let left = ms;
+  const iv = setInterval(() => {
+    if (!alive()) { clearInterval(iv); return res(); }
+    if (paused) return;
+    left -= 50 * speed;
+    if (left <= 0) { clearInterval(iv); res(); }
+  }, 50);
+});
+
+async function type(el, full, alive, cps = 38) {
+  const step = 1000 / cps;
+  for (let i = 1; i <= full.length; i++) {
+    if (!alive()) return;
+    el.textContent = full.slice(0, i);
+    cardBody.scrollTop = cardBody.scrollHeight;   // 卡内自动滚到底
+    scrollBottom();
+    await sleep(step, alive);
+  }
+}
+
+async function typeHtml(el, full, alive, cps = 55) {
+  const step = 1000 / cps;
+  for (let i = 1; i <= full.length; i++) {
+    if (!alive()) return;
+    el.innerHTML = answerHtml(full.slice(0, i));
+    scrollBottom();
+    await sleep(step, alive);
+  }
+}
+
+function markFsm(st) {
+  [...$fsm.querySelectorAll('tr[data-st]')].forEach(tr =>
+    tr.classList.toggle('active', tr.dataset.st === st));
+}
+
+function setPhase(text) { $phase.textContent = text; }
+
+async function play() {
+  const my = ++token;
+  const alive = () => my === token;
+
+  clearInterval(cardTimer);
+  $msgs.innerHTML = '';
+  buildCard();
+  paused = false;
+  $fakeBtn.textContent = '停止';
+  $fakeBtn.classList.add('stop');
+
+  for (const s of SCRIPT) {
+    if (!alive()) return;
+
+    if (s.t === 'user') {
+      addUser(s.text);
+      setPhase('已发送');
+      scrollBottom();
+    }
+
+    else if (s.t === 'waiting') {
+      // 延迟出现：空窗超过阈值才渲染 waiting，否则卡根本不出场，
+      // 直接由下一个 think 步骤以 thinking 形态登场。
+      const waitStart = Date.now();
+      markFsm('waiting');
+      if (s.ms > threshold) {
+        setPhase(`waiting（延迟 ${threshold}ms）`);
+        await sleep(threshold, alive);
+        if (!alive()) return;
+        cardShow('waiting', waitStart);
+        setPhase('waiting');
+        await sleep(s.ms - threshold, alive);
+      } else {
+        setPhase(`空窗 ${s.ms}ms < 阈值，waiting 跳过`);
+        await sleep(s.ms, alive);
+      }
+    }
+
+    else if (s.t === 'think') {
+      cardShow('thinking', Date.now());
+      setPhase('thinking');
+      markFsm('thinking');
+      const target = cardBody.querySelector('[data-text]');
+      if (document.getElementById('chk-show').checked) {
+        await type(target, s.text, alive);
+      } else {
+        await sleep(s.text.length * 26, alive);   // 关了开关也要走完同样的时长
+      }
+      await sleep(300, alive);
+    }
+
+    else if (s.t === 'tool') {
+      cardHide();                                  // ← 首个可见产物到达，卡消失
+      markFsm('hidden-visible');
+      setPhase('工具执行中');
+      const el = addTool(s.tool);
+      scrollBottom();
+      await sleep(240, alive);
+      markFsm('hidden-tool');
+      await sleep(s.runMs, alive);
+      finishTool(el);
+      markFsm('back-wait');
+      await sleep(260, alive);
+    }
+
+    else if (s.t === 'answer') {
+      cardHide();                                  // ← 首个可见产物到达，卡消失
+      markFsm('hidden-visible');
+      setPhase('回答中');
+      const el = addAnswer();
+      await typeHtml(el.querySelector('[data-answer]'), s.text, alive);
+      el.querySelector('.caret')?.remove();
+    }
+
+    else if (s.t === 'end') {
+      cardHide();
+      card.remove();
+      markFsm('destroy');
+      setPhase('结束');
+      $fakeBtn.textContent = '发送';
+      $fakeBtn.classList.remove('stop');
+    }
+  }
+}
+
+/* 「刷新后」：同一个 turn，历史态渲染——无卡、无思考 */
+function showReloaded() {
+  ++token;                       // 掐断播放
+  clearInterval(cardTimer);
+  paused = false;
+  $msgs.innerHTML = '';
+  addUser(USER);
+  SCRIPT.filter(s => s.t === 'tool').forEach(s => finishTool(addTool(s.tool)));
+  const el = addAnswer();
+  el.querySelector('[data-answer]').innerHTML = answerHtml(ANSWER);
+  el.querySelector('.caret')?.remove();
+  markFsm(null);
+  setPhase('历史 / 刷新后');
+  $fakeBtn.textContent = '发送';
+  $fakeBtn.classList.remove('stop');
+  scrollBottom();
+}
+
+/* ══ 状态定格 ══════════════════════════════════════════════ */
+
+const FRAMES = [
+  { name: 'waiting', note: '提交后 / 工具结束后', html: `
+    <div class="live waiting">
+      <div class="live-head"><span class="dot"></span><span>等待模型 · 3s</span></div>
+    </div>` },
+  { name: 'thinking', note: '收到 reasoning delta', html: `
+    <div class="live">
+      <div class="live-head"><span class="dot"></span><span>💭 思考中 · 12s</span></div>
+      <div class="live-body">写成功了，但我手上只有相对文件名。用户要的是"文件在哪"，只说"写好了"等于没说——得先拿到当前工作目录<span class="caret"></span></div>
+    </div>` },
+  { name: 'thinking（长文本·限高 6 行）', note: '卡内滚动，不顶输入框', html: `
+    <div class="live">
+      <div class="live-head"><span class="dot"></span><span>💭 思考中 · 27s</span></div>
+      <div class="live-body" style="scroll-behavior:auto">用户没有逐条回答，那就按最合理的默认来，别再追问第二轮惹人烦。文件名取相声标题《我和AI搭伙》，扩展名用 .md——正文有标题层级和对白结构，markdown 是最自然的载体，而且他后面大概率还要改，纯文本比 docx 好编辑得多。路径先按当前工作目录，不擅自往桌面或文档目录塞。内容直接取上一轮生成的那段完整相声，不做删改，格式上把角色名加粗、每段对白独立成行，方便他直接拿去排练。<span class="caret"></span></div>
+    </div>` },
+  { name: 'thinking（开关关闭）', note: '只剩标题 + 计时', html: `
+    <div class="live">
+      <div class="live-head"><span class="dot"></span><span>💭 思考中 · 12s</span></div>
+    </div>` },
+  { name: '隐藏（工具执行中）', note: 'ToolCard 自带 running 指示', html: `
+    <div class="is-running">
+      <button class="tool-row" aria-expanded="false" data-toggle>
+        <span class="chev">▸</span><span class="ico">📝</span>
+        <span class="verb">写入</span><span class="target">我和AI搭伙.md</span>
+        <span class="tool-spinner"></span>
+      </button>
+      <div class="tool-body" hidden>
+        <div class="kv"><div class="kv-row"><span class="kv-key">path:</span><span class="kv-val">我和AI搭伙.md</span></div></div>
+      </div>
+    </div>` },
+  { name: '结束 / 历史', note: '卡不存在，与今天逐字相同', html: `
+    <div>
+      <button class="tool-row" aria-expanded="false" data-toggle>
+        <span class="chev">▸</span><span class="ico">📍</span><span class="verb">当前目录</span>
+      </button>
+      <div class="tool-body" hidden>
+        <span class="out-label">输出</span><pre class="out-content">C:\\Users\\guorui1\\.oc\\workspace</pre>
+      </div>
+      <div class="bubble-row" style="margin-top:8px"><div class="bubble assistant">已经把相声保存为文件了，路径是 <code>…\\我和AI搭伙.md</code>。</div></div>
+    </div>` },
+];
+
+document.getElementById('frames').innerHTML = FRAMES.map(f => `
+  <div class="frame">
+    <div class="frame-head">${f.name}<em>${f.note}</em></div>
+    <div class="frame-body">${f.html}</div>
+  </div>`).join('');
+
+/* 定格里的长文本卡：滚到底，展示实际观感 */
+requestAnimationFrame(() => {
+  document.querySelectorAll('.frame .live-body').forEach(b => { b.scrollTop = b.scrollHeight; });
+});
+
+/* ══ 控件 ══════════════════════════════════════════════════ */
+
+document.addEventListener('click', e => {
+  const btn = e.target.closest('[data-toggle]');
+  if (!btn) return;
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  btn.setAttribute('aria-expanded', String(!open));
+  const body = btn.nextElementSibling;
+  if (body) body.hidden = open;
+});
+
+document.getElementById('btn-play').addEventListener('click', play);
+
+document.getElementById('btn-pause').addEventListener('click', e => {
+  paused = !paused;
+  e.currentTarget.textContent = paused ? '▶ 继续' : '⏸ 暂停';
+});
+
+document.getElementById('btn-reload').addEventListener('click', showReloaded);
+
+document.getElementById('seg-speed').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  speed = parseFloat(b.dataset.speed);
+  [...e.currentTarget.children].forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+});
+
+document.getElementById('seg-thr').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  threshold = parseInt(b.dataset.thr, 10);
+  [...e.currentTarget.children].forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  play();
+});
+
+play();
+</script>
+</body>
+</html>
