@@ -106,6 +106,11 @@ function submit() {
     },
     onTool(ev) {
       if (ev.phase?.phase === 'start') {
+        // step 边界：定格本 step 的文本气泡，否则下一 step 的文本会被
+        // updateLastAssistant 的 findLast(pending) 追加进**这一条**里——它的位置
+        // 在后续 ToolCard 之前，于是最终回答会显示在工具卡上方（刷新后才正常，
+        // 因为 loadHistory 按 seq 重建）。
+        finalizeLastAssistant(target)
         activityFor(target).visible()
         clearTimeout(waitTimers.get(target))
         appendMessage(target, {
