@@ -467,6 +467,7 @@ impl App {
                 // 实时更新上下文用量提示（显示在状态栏）。
                 self.usage_hint = Some(format_usage(input_tokens, context_window));
             }
+            Event::Reasoning { .. } => {}
         }
     }
 
@@ -600,6 +601,7 @@ fn event_session(ev: &Event) -> Option<&SessionId> {
     Some(match ev {
         Event::Lifecycle { session, .. }
         | Event::Assistant { session, .. }
+        | Event::Reasoning { session, .. }
         | Event::Tool { session, .. }
         | Event::Proactive { session, .. }
         | Event::Task { session, .. }

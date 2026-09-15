@@ -51,6 +51,7 @@ fn ev_session(ev: &Event) -> &SessionId {
     match ev {
         Event::Lifecycle { session, .. }
         | Event::Assistant { session, .. }
+        | Event::Reasoning { session, .. }
         | Event::Tool { session, .. }
         | Event::Proactive { session, .. }
         | Event::Task { session, .. }
