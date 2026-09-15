@@ -7,6 +7,7 @@
 
 import { reactive, shallowReactive } from 'vue'
 import { fetchSessions, fetchHistory, fetchStatus, openAmbientStream } from './api.js'
+import { createActivity } from './activity.js'
 
 // ── Session list ──────────────────────────────────────────────────────────────
 
@@ -231,4 +232,14 @@ export function setActiveChatCtrl(sessionId, ctrl) {
 
 export function clearActiveChatCtrl(sessionId) {
   activeChats.delete(sessionId)
+}
+
+// ── Per-session live activity (单例活动卡) ─────────────────────────────
+// 按 sessionId 键入，与 activeChats 同构：ChatPane 无 :key，切换会话不重新
+// 挂载，卡状态若放局部 ref 会在会话间串台。放进这里 back-keep 语义才成立。
+const activities = reactive({})
+
+export function activityFor(sessionId) {
+  if (!activities[sessionId]) activities[sessionId] = createActivity()
+  return activities[sessionId]
 }
