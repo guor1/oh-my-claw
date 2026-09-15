@@ -85,6 +85,7 @@ export async function fetchStatus() {
  * @param {string}   opts.text      - user message
  * @param {function} opts.onAccepted  - ({run_id, session}) → void
  * @param {function} opts.onDelta     - (text_delta: string) → void
+ * @param {function} opts.onReasoning - (delta: string) → void
  * @param {function} opts.onTool      - (event) → void
  * @param {function} opts.onApproval  - (event) → void
  * @param {function} opts.onUserInput - (event) → void
@@ -132,6 +133,9 @@ export function sendChat(opts) {
               break
             case 'assistant':
               opts.onDelta?.(data.delta ?? '')
+              break
+            case 'reasoning':
+              opts.onReasoning?.(data.delta ?? '')
               break
             case 'tool':
               opts.onTool?.(data)

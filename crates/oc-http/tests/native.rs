@@ -293,6 +293,7 @@ async fn ambient_stream_excludes_inline_run_events() {
     let daemon = TestDaemon::start(
         "nat-amb",
         Arc::new(MockProvider::scripted(vec![
+            ScriptStep { delay: Duration::from_millis(50), delta: Delta::Reasoning("内联思考".into()) },
             ScriptStep { delay: Duration::from_millis(50), delta: Delta::Text("内联文本".into()) },
             ScriptStep { delay: Duration::ZERO, delta: Delta::Done(FinishReason::Stop) },
         ])),
@@ -346,6 +347,14 @@ async fn ambient_stream_excludes_inline_run_events() {
     assert!(
         !ambient_buf.contains("内联文本"),
         "ambient 流不该出现回复正文：{ambient_buf}"
+    );
+    assert!(
+        !ambient_buf.contains("reasoning"),
+        "reasoning 是内联事件，绝不该出现在 ambient 流：{ambient_buf}"
+    );
+    assert!(
+        !ambient_buf.contains("内联思考"),
+        "ambient 流不该出现 reasoning 正文：{ambient_buf}"
     );
 }
 
@@ -475,4 +484,34 @@ async fn history_exposes_tool_call_structure() {
         .find(|e| e.get("role").and_then(|r| r.as_str()) == Some("tool") && e.get("tool_call_id").is_some())
         .unwrap_or_else(|| panic!("tool 条目应带 tool_call_id：{history}"));
     assert_eq!(result.get("tool_call_id").and_then(|n| n.as_str()), Some("call-hist"));
+}
+
+/// reasoning 应作为内联事件出现在 chat/send 的 SSE 流上，事件名是 `reasoning`。
+#[tokio::test]
+async fn chat_send_streams_reasoning_events() {
+    use oc_llm::mock::{MockProvider, ScriptStep};
+    let daemon = TestDaemon::start(
+        "nat-reas",
+        Arc::new(MockProvider::scripted(vec![
+            ScriptStep { delay: Duration::from_millis(20), delta: Delta::Reasoning("先想想".into()) },
+            ScriptStep { delay: Duration::from_millis(20), delta: Delta::Text("正文".into()) },
+            ScriptStep { delay: Duration::ZERO, delta: Delta::Done(FinishReason::Stop) },
+        ])),
+    )
+    .await;
+    let base = spawn_gateway(daemon.transport(), 8).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/v1/chat/send"))
+        .json(&serde_json::json!({ "session": "nat-reas-s", "text": "hi" }))
+        .send()
+        .await
+        .expect("send 应有应答");
+    let body = read_sse(resp, Duration::from_secs(20)).await;
+
+    let names = event_names(&body);
+    assert!(names.iter().any(|n| n == "reasoning"), "SSE 应含 reasoning 事件，实际：{names:?}");
+    assert!(body.contains("先想想"), "reasoning 正文应透传，实际：{body}");
+    assert!(body.contains(r#""event":"reasoning""#), "data 里应带 event 标签：{body}");
 }

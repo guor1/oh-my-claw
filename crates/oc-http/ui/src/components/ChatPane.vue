@@ -2,7 +2,9 @@
 import { ref, computed, watchEffect } from 'vue'
 import MessageBubble from './MessageBubble.vue'
 import ApprovalModal from './ApprovalModal.vue'
+import LiveActivity from './LiveActivity.vue'
 import { sendChat, sendCommand, approvalReply, userReply } from '../lib/api.js'
+import { WAIT_THRESHOLD_MS } from '../lib/activity.js'
 import {
   messagesFor,
   appendMessage,
@@ -18,6 +20,7 @@ import {
   loadSessions,
   loadHistory,
   activeSessionId,
+  activityFor,
 } from '../lib/state.js'
 
 const props = defineProps({
@@ -33,10 +36,23 @@ const errorText = ref(null)
 const messages = computed(() => messagesFor(props.sessionId))
 const isStreaming = computed(() => activeChats.has(props.sessionId))
 
+const waitTimers = new Map()   // sessionId -> timeout id
+
+function scheduleWait(sessionId) {
+  clearTimeout(waitTimers.get(sessionId))
+  const t = setTimeout(() => {
+    const act = activityFor(sessionId)
+    act.showWaiting(Date.now())
+  }, WAIT_THRESHOLD_MS)
+  waitTimers.set(sessionId, t)
+}
+
 // Autoscroll when message count or the last message's length changes.
 watchEffect(() => {
   const len = messages.value.length
   const tail = messages.value.at(-1)?.content?.length
+  const act = activityFor(props.sessionId)
+  const _ = act.state + act.thinkingText.length   // 卡的出现/形态切换也触发滚动
   if (scroller.value) {
     // rAF so the DOM has painted the new content before we measure.
     requestAnimationFrame(() => {
@@ -67,6 +83,10 @@ function submit() {
   // user switches away mid-stream (back-keep semantics).
   const target = props.sessionId
 
+  const act = activityFor(target)
+  act.arm(Date.now())
+  scheduleWait(target)
+
   const ctrl = sendChat({
     session: target,
     text,
@@ -75,11 +95,19 @@ function submit() {
       // silent: true keeps the existing list visible and skips the skeleton flash.
       loadSessions({ silent: true })
     },
+    onReasoning(delta) {
+      clearTimeout(waitTimers.get(target))
+      activityFor(target).reasoning(delta, Date.now())
+    },
     onDelta(delta) {
+      clearTimeout(waitTimers.get(target))
+      activityFor(target).visible()
       updateLastAssistant(target, delta)
     },
     onTool(ev) {
       if (ev.phase?.phase === 'start') {
+        activityFor(target).visible()
+        clearTimeout(waitTimers.get(target))
         appendMessage(target, {
           id: `tool-${ev.call_id}`,
           role: 'tool',
@@ -105,6 +133,8 @@ function submit() {
           m.toolStatus = ev.phase.status
           m.status = ev.phase.status
         }
+        activityFor(target).toolEnd(Date.now())
+        scheduleWait(target)
       }
     },
     onApproval(ev) {
@@ -114,10 +144,14 @@ function submit() {
       pendingInput.value = ev
     },
     onEnd() {
+      activityFor(target).end()
+      clearTimeout(waitTimers.get(target))
       finalizeLastAssistant(target)
       clearActiveChatCtrl(target)
     },
     onError(msg) {
+      activityFor(target).end()
+      clearTimeout(waitTimers.get(target))
       finalizeLastAssistant(target)
       clearActiveChatCtrl(target)
       errorText.value = msg
@@ -157,6 +191,8 @@ async function submitCommand(text) {
 }
 
 function stop() {
+  clearTimeout(waitTimers.get(props.sessionId))
+  activityFor(props.sessionId).end()
   activeChats.get(props.sessionId)?.abort()
   clearActiveChatCtrl(props.sessionId)
   finalizeLastAssistant(props.sessionId)
@@ -200,6 +236,7 @@ async function respondInput(text) {
       </div>
       <template v-else>
         <MessageBubble v-for="msg in messages" :key="msg.id" :msg="msg" />
+        <LiveActivity :act="activityFor(props.sessionId)" />
       </template>
     </div>
 

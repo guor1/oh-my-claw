@@ -131,6 +131,7 @@ fn belongs(ev: &Event, run_id: &RunId, session: &SessionId) -> bool {
     match ev {
         Event::Lifecycle { run_id: r, .. }
         | Event::Assistant { run_id: r, .. }
+        | Event::Reasoning { run_id: r, .. }
         | Event::Tool { run_id: r, .. }
         | Event::Approval { run_id: r, .. }
         | Event::UserInput { run_id: r, .. } => r == run_id,
@@ -144,6 +145,7 @@ pub(crate) fn event_name(ev: &Event) -> &'static str {
     match ev {
         Event::Lifecycle { .. } => "lifecycle",
         Event::Assistant { .. } => "assistant",
+        Event::Reasoning { .. } => "reasoning",
         Event::Tool { .. } => "tool",
         Event::Proactive { .. } => "proactive",
         Event::Task { .. } => "task",

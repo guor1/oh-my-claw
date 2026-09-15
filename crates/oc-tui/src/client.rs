@@ -108,12 +108,26 @@ impl ClientTransport {
             if n == 0 {
                 return Ok(None);
             }
-            let t = self.line.trim_end();
-            if t.is_empty() {
-                continue;
+            if let Some(frame) = decode_frame(&self.line)? {
+                return Ok(Some(frame));
             }
-            let frame = serde_json::from_str::<Frame>(t)?;
-            return Ok(Some(frame));
+            // decode_frame 返回 None：空行或坏帧，继续读下一行。
+        }
+    }
+}
+
+/// 解码一行 NDJSON。空行返回 `Ok(None)`（跳过）；坏帧 skip + warn 后也返回
+/// `Ok(None)`，不让一条脏行杀掉整条连接（对齐 oc-http `conn_pool.rs` 的宽容策略）。
+fn decode_frame(line: &str) -> Result<Option<Frame>> {
+    let t = line.trim_end();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_str::<Frame>(t) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) => {
+            eprintln!("oc-tui: 跳过无法解析的帧（{e}）");
+            Ok(None)
         }
     }
 }
@@ -167,6 +181,38 @@ impl tokio::io::AsyncWrite for Stream {
             Stream::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             #[cfg(windows)]
             Stream::Pipe(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_proto::{Event, LifecyclePhase};
+
+    #[test]
+    fn decode_skips_unknown_frame_kind() {
+        // 服务端将来新增的 kind 不该让旧 client 断连。
+        let r = decode_frame(r#"{"kind":"future_kind","x":1}"#);
+        assert!(r.unwrap().is_none(), "未知 kind 应被跳过");
+    }
+
+    #[test]
+    fn decode_skips_empty_and_malformed_lines() {
+        assert!(decode_frame("   ").unwrap().is_none(), "空行应跳过");
+        assert!(decode_frame("{not json").unwrap().is_none(), "坏 JSON 应跳过");
+    }
+
+    #[test]
+    fn decode_parses_valid_event() {
+        let f = decode_frame(
+            r#"{"kind":"event","event":"lifecycle","session":"main","run_id":"r1","phase":{"phase":"end"}}"#,
+        )
+        .unwrap()
+        .expect("合法帧应解析");
+        match f {
+            Frame::Event(Event::Lifecycle { phase: LifecyclePhase::End, .. }) => {}
+            other => panic!("应解析成 lifecycle end，得到 {other:?}"),
         }
     }
 }

@@ -143,3 +143,40 @@ async fn api_404_is_not_html() {
         "API 404 不该返回 HTML（否则 fetch 调用方解析失败）：{ct}"
     );
 }
+
+use oc_llm::mock::ScriptStep;
+use oc_llm::{Delta, FinishReason};
+
+/// Responses 协议没有 thinking 事件：reasoning 必须被静默，只吐可见文本。
+#[tokio::test]
+async fn responses_endpoint_silently_drops_reasoning() {
+    use oc_llm::mock::MockProvider;
+    let daemon = TestDaemon::start(
+        "web-reas",
+        Arc::new(MockProvider::scripted(vec![
+            ScriptStep { delay: Duration::from_millis(20), delta: Delta::Reasoning("隐藏的思考".into()) },
+            ScriptStep { delay: Duration::from_millis(20), delta: Delta::Text("可见回答".into()) },
+            ScriptStep { delay: Duration::ZERO, delta: Delta::Done(FinishReason::Stop) },
+        ])),
+    )
+    .await;
+    let pool = oc_http::conn_pool::ConnPool::new(daemon.transport(), 4, 4);
+    let app = oc_http::create_app(pool, "mock".into(), oc_http::AppConfig { token: None, web_ui: false });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("绑端口");
+    let addr = listener.local_addr().expect("取端口");
+    tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+    let base = format!("http://{addr}");
+
+    let client = reqwest::Client::new();
+    let body = client
+        .post(format!("{base}/v1/responses"))
+        .json(&serde_json::json!({ "input": "hi", "stream": false }))
+        .send()
+        .await
+        .expect("应有应答")
+        .text()
+        .await
+        .expect("读 body");
+    assert!(body.contains("可见回答"), "Responses 应含可见文本：{body}");
+    assert!(!body.contains("隐藏的思考"), "reasoning 不得泄漏进 Responses：{body}");
+}

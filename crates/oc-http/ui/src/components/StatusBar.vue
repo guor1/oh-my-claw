@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { status } from '../lib/state.js'
+import { status, activeChats } from '../lib/state.js'
 
 // Rough progress: input tokens / context window, capped at 100%.
 const pct = computed(() =>
@@ -14,6 +14,10 @@ const pctColor = computed(() =>
   : pct.value >= 60 ? 'var(--warn)'
   : 'var(--success)'
 )
+
+// 本 Web 客户端自己发起的 run 是否还在进行。不用 status.active_run：
+// 那个字段只在 ambient SSE 开场 snapshot 赋值一次，之后永不更新（死指示灯）。
+const isRunning = computed(() => activeChats.size > 0)
 </script>
 
 <template>
@@ -31,7 +35,7 @@ const pctColor = computed(() =>
       </span>
       <span class="token-label">{{ pct }}% ctx</span>
     </span>
-    <span v-if="status.active_run" class="chip running">
+    <span v-if="isRunning" class="chip running">
       <span class="dot" aria-hidden="true"></span>
       生成中
     </span>

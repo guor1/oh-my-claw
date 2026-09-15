@@ -588,10 +588,21 @@ async fn run_model_turn(
                 // 诊断：刷新 last_delta_at + 累计文本长度（phase→Streaming）。
                 ctx.diag.delta_seen(acc.chars().count());
             }
-            // thinking 内容：仅累积（供工具调用轮回喂），不进 assistant 可见文本、
-            // 不落库、不推事件流。
+            // thinking 内容：累积（供工具调用轮回喂），不进 assistant 可见文本、不落库。
+            // 另推给客户端实时展示（见下 emit_inline）。
             Delta::Reasoning(r) => {
                 reasoning.push_str(&r);
+                // 与 Assistant 同走 inline 通道，emit_inline 内部在连接断开时会 cancel，
+                // 无需显式处理返回值。
+                let _ = emit_inline(
+                    ctx,
+                    Event::Reasoning {
+                        session: ctx.session_id.clone(),
+                        run_id: ctx.run_id.clone(),
+                        delta: r.clone(),
+                    },
+                )
+                .await;
             }
             Delta::ToolCall(tc) => {
                 if !tc.call_id.is_empty() {

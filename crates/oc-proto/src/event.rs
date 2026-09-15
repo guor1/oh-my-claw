@@ -25,6 +25,13 @@ pub enum Event {
         run_id: RunId,
         delta: String,
     },
+    /// thinking 模型的推理增量。与 Assistant 分开：它不是可见回答，
+    /// 只供客户端实时展示，不落库、不参与 prompt 重放。
+    Reasoning {
+        session: SessionId,
+        run_id: RunId,
+        delta: String,
+    },
     /// 工具活动。
     Tool {
         session: SessionId,
@@ -156,6 +163,7 @@ mod tests {
         let variants = vec![
             Event::Lifecycle { session: s.clone(), run_id: RunId::new("r"), phase: LifecyclePhase::Start },
             Event::Assistant { session: s.clone(), run_id: RunId::new("r"), delta: "hi".into() },
+            Event::Reasoning { session: s.clone(), run_id: RunId::new("r"), delta: "想一下".into() },
             Event::Tool {
                 session: s.clone(),
                 run_id: RunId::new("r"),
