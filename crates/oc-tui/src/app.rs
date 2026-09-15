@@ -59,6 +59,10 @@ pub struct App {
     /// 到此时刻才显示「排队中…」。Some=有一个已提交但未起步的轮在等待此截止点；
     /// 收到 Start 或该轮终态时清空。避免车道空闲时「排队中」一闪而过。
     pending_queue_hint: Option<std::time::Instant>,
+    /// thinking 模型的推理内容尾部（状态栏滚动显示）。有界，只留末尾。
+    reasoning_tail: String,
+    /// 是否渲染 reasoning（键位切换；仅控制显示，事件照收）。
+    show_reasoning: bool,
 }
 
 /// 「排队中…」去抖延迟：发送后超过此时长仍未起步才提示排队。
@@ -93,6 +97,8 @@ impl App {
             usage_hint: None,
             scroll_back: 0,
             pending_queue_hint: None,
+            reasoning_tail: String::new(),
+            show_reasoning: true,
         };
         // 等 hello。
         if let Some(Frame::Res(res)) = app.client.recv().await? {
@@ -100,7 +106,7 @@ impl App {
                 ResResult::Ok(_) => {
                     app.connected = true;
                     app.status = "已连接".to_string();
-                    app.push_sys("已连接到 oc daemon。输入消息回车发送，/help 看指令，Ctrl-C 退出。");
+                    app.push_sys("已连接到 oc daemon。输入消息回车发送，/help 看指令，Ctrl-T 开关思考显示，Ctrl-C 退出。");
                 }
                 ResResult::Err(e) => {
                     app.status = format!("连接被拒: {}", e.message);
@@ -257,6 +263,12 @@ impl App {
             KeyCode::End if mods.contains(KeyModifiers::CONTROL) => {
                 self.scroll_back = 0;
             }
+            KeyCode::Char('t') if mods.contains(KeyModifiers::CONTROL) => {
+                self.show_reasoning = !self.show_reasoning;
+                if !self.show_reasoning {
+                    self.reasoning_tail.clear();
+                }
+            }
             KeyCode::Char(c) if is_text_char(mods) => {
                 self.input.push(c);
             }
@@ -397,14 +409,17 @@ impl App {
                 }
                 LifecyclePhase::End => {
                     self.pending_queue_hint = None;
+                    self.reasoning_tail.clear();
                     self.status = "已连接".to_string();
                 }
                 LifecyclePhase::Error { message, .. } => {
                     self.pending_queue_hint = None;
+                    self.reasoning_tail.clear();
                     self.status = format!("错误: {message}");
                 }
             },
             Event::Assistant { delta, run_id, .. } => {
+                self.reasoning_tail.clear();
                 // 流式增量：只追加到**同一个 run** 的最后一条助手消息，否则新起一条。
                 //
                 // 只判 `who == "助手"` 会把不同 run 的回复拼成一段读不通的话：
@@ -430,6 +445,7 @@ impl App {
             }
             Event::Tool { phase, .. } => match phase {
                 oc_proto::ToolPhase::Start { name, args } => {
+                    self.reasoning_tail.clear();
                     self.msgs.push(Msg {
                         who: "工具",
                         text: format!("{name}: {}", truncate(&args, 200)),
@@ -467,7 +483,19 @@ impl App {
                 // 实时更新上下文用量提示（显示在状态栏）。
                 self.usage_hint = Some(format_usage(input_tokens, context_window));
             }
-            Event::Reasoning { .. } => {}
+            Event::Reasoning { delta, .. } => {
+                if !self.show_reasoning {
+                    return;
+                }
+                // 换行压成空格，避免推理内容里带进换行把状态栏撑成多行。
+                self.reasoning_tail.push_str(&delta.replace(['\r', '\n'], " "));
+                // 有界：只留末尾，防长推理无限增长。
+                const TAIL_CAP: usize = 512;
+                let len = self.reasoning_tail.chars().count();
+                if len > TAIL_CAP {
+                    self.reasoning_tail = self.reasoning_tail.chars().skip(len - TAIL_CAP).collect();
+                }
+            }
         }
     }
 
@@ -536,10 +564,15 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title("输入"));
         f.render_widget(input, chunks[1]);
 
-        // 状态栏：状态文本 +（可选）上下文用量。
-        let status_line = match &self.usage_hint {
-            Some(u) => format!("{}  |  ctx {}", self.status, u),
-            None => self.status.clone(),
+        // 状态栏：thinking 活跃时让位给推理滚动；否则沿用原有状态 + 用量。
+        let status_line = if self.show_reasoning && !self.reasoning_tail.is_empty() {
+            let max_cols = chunks[2].width.saturating_sub(3) as usize; // 留 💭 前缀
+            format!("💭 {}", tail_display(&self.reasoning_tail, max_cols))
+        } else {
+            match &self.usage_hint {
+                Some(u) => format!("{}  |  ctx {}", self.status, u),
+                None => self.status.clone(),
+            }
         };
         let status = Paragraph::new(status_line).style(Style::default().fg(Color::DarkGray));
         f.render_widget(status, chunks[2]);
@@ -559,6 +592,28 @@ fn short_k(n: u32) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// 取字符串的末尾 `max_cols` 个显示列宽（中文双宽按列算，不按字符数）。
+/// delta 持续追加、显示始终取尾部，天然形成左滚，无需动画定时器。
+fn tail_display(s: &str, max_cols: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    let skip = s.width() - max_cols; // 从左边跳过的列宽
+    let mut cols = 0usize;
+    let mut start = s.len();
+    for (i, c) in s.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if cols + w > skip {
+            start = i;
+            break;
+        }
+        cols += w;
+        start = i + c.len_utf8();
+    }
+    s[start..].to_string()
 }
 
 /// 非文本修饰键（Ctrl/Alt/Super/Hyper/Meta）；带这些的 `Char` 不是可输入字符。
@@ -679,5 +734,26 @@ mod tests {
         assert!(is_text_char(KeyModifiers::SHIFT));
         assert!(!is_text_char(KeyModifiers::CONTROL));
         assert!(!is_text_char(KeyModifiers::ALT));
+    }
+
+    #[test]
+    fn tail_display_keeps_tail_columns() {
+        // "你好世界" = 8 列宽（每字 2）。取尾 4 列应得 "好世"？不——"你好世界" 四字各 2 列，
+        // 尾 4 列 = 后两个字 "世界"。
+        assert_eq!(tail_display("你好世界", 4), "世界");
+        // 全 ASCII，尾 3 = "xyz"
+        assert_eq!(tail_display("abcdefxyz", 3), "xyz");
+    }
+
+    #[test]
+    fn tail_display_short_enough_unchanged() {
+        assert_eq!(tail_display("短", 10), "短");
+        assert_eq!(tail_display("abc", 3), "abc");
+    }
+
+    #[test]
+    fn tail_display_handles_mixed_width() {
+        // "a好b" = 1 + 2 + 1 = 4 列。尾 3 列 = "好b"。
+        assert_eq!(tail_display("a好b", 3), "好b");
     }
 }
