@@ -86,20 +86,45 @@ Reasoning {
 
 ### B. Web UI：单例活动卡 `LiveActivity.vue`
 
-**唯一的新渲染单元**，常驻消息流尾部，不进 `messageMap`（它不是消息）。
+**唯一的新渲染单元**，不进 `messageMap`（它不是消息）。渲染在 `ChatPane.vue` 模板里
+`MessageBubble` 的 `v-for` 之后、`.error-banner` 之前——始终位于消息流尾部。
 状态机：
 
 | 触发 | 形态 |
 |---|---|
-| 提交后立即 | `waiting`：「等待模型 · 3s」+ 计时 |
+| 提交后 / 工具结束后，空窗超过阈值 | `waiting`：「等待模型 · 3s」+ 计时 |
 | 收到 `reasoning` delta | `thinking`：「思考中 · 12s」+ 流式正文 |
 | 收到本 step 首个可见产物（`assistant` delta 或 `tool` start） | **隐藏** |
 | 工具执行中（start → end） | 保持隐藏（ToolCard 自带 running 指示） |
-| `tool` end 且 run 未结束 | 回到 `waiting` |
+| `tool` end 且 run 未结束 | 回到 `waiting`（同样走延迟） |
 | `lifecycle` end / error，或用户停止 | 隐藏并销毁 |
 
 要点：
 
+- **状态按 sessionId 存在 `state.js`，不能用 `ChatPane` 的局部 `ref`**。
+  `App.vue` 里 `<ChatPane :session-id="activeSessionId.value" />` **没有 `:key`**，
+  切换会话时 ChatPane 不重新挂载、只是 prop 变了——局部 ref 会让用户在会话 B
+  看见会话 A 的思考卡。放进 `state.js`、与 `activeChats` 同样按 session 键入，
+  back-keep 语义才成立（切走再切回，该会话自己的卡状态还在）。
+  （现有 `pendingApproval` / `pendingInput` / `errorText` 都是局部 ref，有同样的
+  串台问题；不在本次范围内修，但**不要照抄这个模式**。）
+- **自动滚动要把卡算进去**。`ChatPane.vue:37-46` 的 `watchEffect` 只读
+  `messages.value.length` 与末条 `content.length` 建立依赖；卡不在 `messages` 里，
+  它的出现与形态切换**不会触发滚动**，结果是卡把内容顶上去而视口不跟。
+  把卡的状态一并读进那个 `watchEffect`。
+  卡自身有限高（见下），高度只会变化有限几次，不必每个 delta 都滚。
+- **`waiting` 延迟出现**。空窗常常只有几百毫秒，立刻渲染会让卡闪一下就换成
+  `thinking`，纯属视觉噪音。设一个阈值（**暂定 400ms**），空窗超过它才渲染 `waiting`；
+  没超过就直接以 `thinking` 形态出现。两条路径最终收敛到同一状态。
+  首个 delta 到达时必须取消未触发的延迟定时器。
+  `thinking` **不延迟**——正文已经在手上了，没有可闪的空档。
+- **阈值要实测校准，不要拍脑袋**。代码里已有现成埋点：`run.rs:510` 附近的
+  「模型流已建立」记建流耗时，每轮结束的 debug 日志带 `ttfb_ms`。注意两者都**不含**
+  `begin_run` 里的 prompt 组装与记忆检索，真实空窗比 `ttfb_ms` 更长，实现时
+  开 debug 跑一轮看实际分布再定。
+- **计时口径**：`waiting` 从本次空窗开始计（提交时刻 / 工具结束时刻），
+  不是从卡出现时刻计——否则显示的秒数比真实等待短一个阈值。
+  `thinking` 从本 step 首个 `reasoning` delta 计。
 - **已完成的思考段不留痕**。不折叠成一行，不挂进 ToolCard，不进历史。切换 step 时
   正文清空重来。因此不需要「这段思考属于哪一步」的归属建模。
 - **限高**：正文最多约 6 行，超出在卡内自动滚到底，不产生外层滚动条——
@@ -107,6 +132,16 @@ Reasoning {
 - **展示开关**（localStorage）：关闭时卡**不消失**，退化为只有标题行与计时器，
   不渲染正文。完全隐藏等于退回静默，那就白做了。
 - 计时器 1s tick，组件卸载时清理。
+
+**`Approval` / `UserInput` 不需要卡做任何处理**（已核实，写下来免得实现时纠结）：
+两者都由 `tools_bridge.rs:282` / `:298` 在 `ToolExecutor` 内部发出，而 `exec_tool`
+在 `run.rs:702` **先**发了 `ToolPhase::Start`——审批框/提问框弹出时卡早已隐藏。
+且 `tools_bridge.rs` 注释写明「审批期间不再 send」，卡不会在等用户时误报「思考中」。
+
+**已知边界（不修）**：多 client 并发时本会话的 turn 可能排队
+（`Snapshot.queued_turns`），此时卡会显示「等待模型」而实际是在排队。
+Web UI 自身有 `isStreaming` 守卫不能并发提交，只有 TUI / 其他 client 同时发才会撞上，
+显示也只是不够精确而非错误。留待将来协议层能区分排队与执行时再说。
 
 `loadHistory` 与 `MessageBubble` **不改**：历史里本就没有 thinking。
 
@@ -121,7 +156,10 @@ Reasoning {
   **从右往左**取能放下的部分。delta 持续追加天然形成左滚，**不需要动画定时器**。
   中文双宽按**显示列宽**算，不能按字符数。
 - 首个 Assistant delta / Tool start / `Lifecycle::End|Error` → 清空 tail，恢复原状态文本。
-- 键位切换 `show_reasoning`（仅控制渲染）。
+- 键位切换 `show_reasoning`（仅控制渲染）。具体按键在实现计划里定，需避开
+  `app.rs` 已注册的按键；并在状态栏或帮助里可发现，否则等于没有。
+- **TUI 不做 `waiting` 态**。状态栏已有 `self.status` 文本承担「现在在干嘛」，
+  再叠一个等待计时是重复。TUI 只接管 thinking 那一段。
 
 ### D. StatusBar 死指示灯
 
@@ -152,6 +190,11 @@ A 落地后 Web / TUI / StatusBar 三件事互不依赖，可并行。
 - **A**：`Reasoning` 事件不出现在 `/v1/responses` 的 SSE 输出里。
 - **B**：状态机六条迁移各一例；尤其「tool end 后回到 waiting」与
   「lifecycle end 后销毁」。
+- **B**：空窗短于阈值时 `waiting` **不出现**，卡直接以 `thinking` 形态出场；
+  且延迟定时器已被取消（不会事后补一次闪烁）。
+- **B**：**会话隔离**——会话 A 正在 thinking 时切到会话 B，B 的视图里没有卡；
+  切回 A，A 的卡状态仍在。这条是防「卡状态写进 ChatPane 局部 ref」的回归保护。
+- **B**：卡出现 / 切换形态时触发了自动滚动（视口跟到底部）。
 - **B**：`loadHistory` 的产物不含任何 thinking 单元。
 - **C**：含中文的 tail 按显示列宽截断，不出现半个字符或越界。
 - **E**：喂一行伪造的未知 `kind` 帧，断言 TUI client 跳过该行且连接存活。
@@ -173,6 +216,13 @@ A 落地后 Web / TUI / StatusBar 三件事互不依赖，可并行。
 **为什么开关关闭时卡不消失？**
 开关管的是「要不要看思维链内容」，不是「要不要知道模型在动」。
 完全隐藏就退回静默了。
+
+**`waiting` 态为什么必须存在？**
+它修的不是 thinking 的静默，是第 2、4 层——首 token 前的空窗。更硬的理由：
+**非 thinking 模型根本不产生 reasoning delta**，对它们来说 `waiting` 是这张卡
+唯一会出现的形态；砍掉它，卡对非 thinking 模型永远不出现，第 2、4 层原封不动。
+thinking 模型某一步不思考直接出文本时，走的也是这条路径。
+代价（短空窗闪一下）用延迟出现消解。
 
 **为什么不合批 reasoning 事件？**
 思维链 delta 密集，但与 Assistant delta 同频、同通道、同背压机制，现状已扛住。
