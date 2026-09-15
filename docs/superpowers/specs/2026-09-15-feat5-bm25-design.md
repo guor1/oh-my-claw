@@ -74,9 +74,15 @@ INSERT INTO memory_fts(rowid, terms) VALUES(?1, ?2);                         -- 
 
 迁移步进 V4：drop 旧 `memory_fts`（若存在）→ 建新形态表。不回填数据（决策 2）。
 新库 `user_version` 从 0 逐级升到 4，V1 建的还是旧形态，V4 重建——两条路径
-（全新库 / 删过的旧库）最终形态一致。
+（全新库 / 删过的旧库）最终形态一致。**既有 V4 以下版本的库升级后，索引为空**：
+`bm25` 全为 `None`（MATCH 收窄为空集，候选查询直接回零行），不炸、不静默错排；
+开发阶段接受，需要记忆时删库重建。
 
 `check_shape` 不改：它查 `memory_fts` 存在性 + `memory.no` 列，新形态下两者都在。
+
+`delete_memory()` / `merge_memory()` 的索引清理同样改走 `'delete'` 命令
+（删行前按 `memory.text` 现值编码扣掉旧 token），与 `index_memory_text()` 同一
+删除原语，抽公共函数避免两处漂移。
 
 ### `search_candidates` 返回 bm25
 
@@ -147,7 +153,7 @@ score = rel * halflife_factor * importance;
 |---|---|---|
 | oc-store | `schema.rs` | V4：重建 `memory_fts` 为外部内容表 |
 | oc-store | `migrate.rs` | 加 step 4；TARGET_VERSION = 4 |
-| oc-store | `ops.rs` | `index_memory_text` 改三步删除语义；`search_candidates` SELECT 加 `bm25()`；mapper |
+| oc-store | `ops.rs` | `index_memory_text` 改三步删除语义（公共删除原语）；`search_candidates` SELECT 加 `bm25()`；mapper |
 | oc-store | `types.rs` | `MemoryRow.bm25` |
 | oc-core | `memory.rs` | `MemCandidate.bm25`、`rank()` 归一、`trigger_prefilter()` 排序键 |
 | oc-server | `dispatch.rs`、`session.rs` | 三处映射各加一行 |
