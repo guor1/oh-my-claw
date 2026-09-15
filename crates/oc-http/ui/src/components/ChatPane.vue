@@ -100,6 +100,7 @@ function submit() {
       activityFor(target).reasoning(delta, Date.now())
     },
     onDelta(delta) {
+      clearTimeout(waitTimers.get(target))
       activityFor(target).visible()
       updateLastAssistant(target, delta)
     },

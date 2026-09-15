@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { ref, computed, onBeforeUnmount } from 'vue'
 
 /**
  * 单例活动卡：不进 messageMap 的瞬时组件，渲染在消息流尾部。
@@ -17,10 +17,15 @@ const isThinking = computed(() => props.act.state === 'thinking')
 const prefs = JSON.parse(localStorage.getItem('oc.liveActivity') || '{}')
 const showText = (prefs.showThinking ?? true) === true
 
+const now = ref(Date.now())
+const tick = setInterval(() => { now.value = Date.now() }, 1000)
+onBeforeUnmount(() => clearInterval(tick))
+
 const seconds = computed(() => {
+  now.value  // 依赖：每秒触发重算
   const since = isThinking.value ? props.act.thinkingSince : props.act.waitingSince
   if (since == null) return 0
-  return Math.max(0, Math.floor((Date.now() - since) / 1000))
+  return Math.max(0, Math.floor((now.value - since) / 1000))
 })
 
 const label = computed(() => (isThinking.value ? '💭 思考中' : '等待模型'))
