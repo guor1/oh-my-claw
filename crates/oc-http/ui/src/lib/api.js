@@ -292,6 +292,9 @@ export function resumeChat({ session, runId, onDelta, onReasoning, onTool, onEnd
           }
         }
       }
+      // 干净但异常的收尾（forward 任务因 send 失败退出、或 daemon 未发终态就关流）
+      // 兜底调用 onEnd，避免 UI 卡在 streaming 态。
+      onEnd?.()
     } catch (err) {
       if (err.name !== 'AbortError') onError?.(err.message)
     }

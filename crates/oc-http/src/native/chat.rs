@@ -93,28 +93,50 @@ fn stream_native(
     run_id: RunId,
     session: SessionId,
 ) -> Pin<Box<dyn Stream<Item = HttpResult<sse::Event>> + Send>> {
+    Box::pin(stream_native_after(conn, run_id, session, Vec::new(), true))
+}
+
+/// [`stream_native`] with an optional `head` of already-buffered `Frame`s.
+///
+/// The resume path reads frames off `conn.rx` until `Res(ChatResume)`, buffering
+/// any `Frame::Event` it meets along the way — those are the replayed (pre-refresh)
+/// events the daemon flushed *before* the `Res`. They must be yielded first, or
+/// the refresh loses the text streamed before the disconnect.
+fn stream_native_after(
+    conn: NdjsonConn,
+    run_id: RunId,
+    session: SessionId,
+    head: Vec<Frame>,
+    emit_accepted: bool,
+) -> Pin<Box<dyn Stream<Item = HttpResult<sse::Event>> + Send>> {
     Box::pin(async_stream::stream! {
         let mut conn = conn;
 
         // Emitted before any daemon event so the client can abort immediately.
-        yield Ok(sse::Event::default()
-            .event("accepted")
-            .data(serde_json::json!({ "run_id": run_id.as_str(), "session": session.as_str() }).to_string()));
+        if emit_accepted {
+            yield Ok(sse::Event::default()
+                .event("accepted")
+                .data(serde_json::json!({ "run_id": run_id.as_str(), "session": session.as_str() }).to_string()));
+        }
+
+        for frame in head {
+            if let Frame::Event(ev) = frame {
+                if let Some((event, terminal)) = sse_for_event(&ev, &run_id, &session) {
+                    yield Ok(event);
+                    if terminal {
+                        return;
+                    }
+                }
+            }
+        }
 
         loop {
             match conn.rx.recv().await {
                 Some(Frame::Event(ev)) => {
-                    if !belongs(&ev, &run_id, &session) {
+                    let Some((event, terminal)) = sse_for_event(&ev, &run_id, &session) else {
                         continue;
-                    }
-                    let terminal = matches!(
-                        &ev,
-                        Event::Lifecycle { phase: LifecyclePhase::End | LifecyclePhase::Error { .. }, .. }
-                    );
-                    match serde_json::to_string(&ev) {
-                        Ok(json) => yield Ok(sse::Event::default().event(event_name(&ev)).data(json)),
-                        Err(e) => tracing::warn!(error = %e, "native sse serialize failed"),
-                    }
+                    };
+                    yield Ok(event);
                     if terminal {
                         break;
                     }
@@ -127,6 +149,31 @@ fn stream_native(
             }
         }
     })
+}
+
+/// Whether an event is a run's terminal lifecycle.
+fn is_terminal(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Lifecycle { phase: LifecyclePhase::End | LifecyclePhase::Error { .. }, .. }
+    )
+}
+
+/// Serialize a run event into its SSE frame, if it belongs to this run/session.
+/// Returns `(event, terminal)`; `None` if the event is filtered out or fails to
+/// serialize.
+fn sse_for_event(ev: &Event, run_id: &RunId, session: &SessionId) -> Option<(sse::Event, bool)> {
+    if !belongs(ev, run_id, session) {
+        return None;
+    }
+    let terminal = is_terminal(ev);
+    match serde_json::to_string(ev) {
+        Ok(json) => Some((sse::Event::default().event(event_name(ev)).data(json), terminal)),
+        Err(e) => {
+            tracing::warn!(error = %e, "native sse serialize failed");
+            None
+        }
+    }
 }
 
 /// Whether an event belongs to this run.
@@ -201,13 +248,34 @@ pub async fn resume(
         None,
     )
     .await?;
-    match await_res(&mut conn).await? {
-        MethodOk::ChatResume { .. } => {}
-        other => return Err(HttpError::Protocol(format!("expected chat_resume ok, got {other:?}"))),
+
+    // 不能盲用 `await_res`：SessionCmd::Resume 在 `reply.send(hit)` 之前就 spawn 了
+    // 回放任务，回放的 Event 会先于 Res(ChatResume) 到达本连接。await_res 会把
+    // 这些交错事件丢掉——刷新前已 stream 的文本就此无声丢失。改成读到
+    // Res(ChatResume) 为止，途中遇到的 Event 缓存下来，先于续流吐出。
+    let mut buffered: Vec<Frame> = Vec::new();
+    loop {
+        match conn.rx.recv().await {
+            Some(Frame::Res(res)) => match res.result {
+                oc_proto::ResResult::Ok(MethodOk::ChatResume { .. }) => break,
+                oc_proto::ResResult::Ok(other) => {
+                    return Err(HttpError::Protocol(format!(
+                        "expected chat_resume ok, got {other:?}"
+                    )))
+                }
+                oc_proto::ResResult::Err(e) => return Err(HttpError::from_proto(e)),
+            },
+            Some(Frame::Event(ev)) => buffered.push(Frame::Event(ev)),
+            Some(_) => {}
+            None => {
+                return Err(HttpError::Protocol("daemon closed before resume ok".into()))
+            }
+        }
     }
 
-    // 复用 stream_native：按 run_id 过滤，Lifecycle::End/Error 终态停。
-    let stream = stream_native(conn, run_id, session);
+    // 复用 stream_native_after：先吐回放的 buffered 事件，再按 run_id 过滤续流，
+    // Lifecycle::End/Error 终态停。resume 无 accepted 事件（run_id 由调用方已知）。
+    let stream = stream_native_after(conn, run_id, session, buffered, false);
     Ok(Sse::new(stream)
         .keep_alive(sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
         .into_response())

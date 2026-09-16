@@ -33,9 +33,13 @@ async function bootstrap() {
 }
 
 async function start() {
+  // 先加载历史，再开 ambient 流。否则 status 快照带着 active_run 到达时，
+  // onStatus 触发的 maybeResume 会往 messageMap['main'] 里写 resume 增量，
+  // 随后 loadHistory 完成把 messageMap['main'] 整体覆盖，丢掉那些增量，
+  // 而 activeChats 已登记，显式的 maybeResume 又变成 no-op。
+  await loadHistory(activeSessionId.value)
   startAmbientStream()
   loadSessions()
-  await loadHistory(activeSessionId.value)
   maybeResume(activeSessionId.value)
 }
 

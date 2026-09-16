@@ -533,6 +533,10 @@ async fn chat_send_streams_reasoning_events() {
 }
 
 /// Detached run 断连后，GET /api/v1/chat/resume 拉回剩余流到终态。
+///
+/// 关键回归（Fix 1）：断连前必须消费一个**非空**前缀，使 RunLog 回放缓冲非空。
+/// resume 得把「断连前已 stream 的前缀（回放）+ 断连后的剩余段（续流）」都吐出来。
+/// 旧实现直接 await_res 丢掉交错事件，导致前缀在 resume 流里消失。
 #[tokio::test]
 async fn resume_endpoint_streams_remainder() {
     use oc_server::testing::SessionConfigExt;
@@ -550,7 +554,7 @@ async fn resume_endpoint_streams_remainder() {
     let base = spawn_gateway(daemon.transport(), 4).await;
     let client = reqwest::Client::new();
 
-    // 发消息（经 /api/v1/chat/send），从首帧 accepted 解析 run_id 后立刻断连。
+    // 发消息（经 /api/v1/chat/send），边消费边收集：run_id + 若干 assistant 前缀段。
     let mut send_stream = client
         .post(format!("{base}/api/v1/chat/send"))
         .json(&serde_json::json!({ "session": "main", "text": "讲个故事" }))
@@ -559,26 +563,41 @@ async fn resume_endpoint_streams_remainder() {
         .expect("send 应建立")
         .bytes_stream();
 
-    let mut buf = String::new();
+    let mut linebuf = String::new();
     let mut run_id = None;
+    let mut prefix: Vec<String> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while run_id.is_none() && tokio::time::Instant::now() < deadline {
+    while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), send_stream.next()).await {
             Ok(Some(Ok(chunk))) => {
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                for line in buf.lines() {
+                linebuf.push_str(&String::from_utf8_lossy(&chunk));
+                // 按完整行消费，跨 chunk 的半行留在 linebuf。
+                while let Some(pos) = linebuf.find('\n') {
+                    let line: String = linebuf.drain(..=pos).collect();
+                    let line = line.trim_end();
                     let Some(p) = line.strip_prefix("data: ") else { continue };
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(p.trim()) else { continue };
                     if let Some(id) = v.get("run_id").and_then(|i| i.as_str()) {
                         run_id = Some(id.to_string());
-                        break;
                     }
+                    if v.get("event").and_then(|e| e.as_str()) == Some("assistant") {
+                        if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                            prefix.push(d.to_string());
+                        }
+                    }
+                }
+                if run_id.is_some() && prefix.len() >= 2 {
+                    break;
                 }
             }
             _ => break,
         }
     }
-    let run_id = run_id.unwrap_or_else(|| panic!("未能取到 run_id：{buf}"));
+    let run_id = run_id.unwrap_or_else(|| panic!("未能取到 run_id：{linebuf}"));
+    assert!(
+        prefix.len() >= 2,
+        "断连前应已 stream 至少 2 段（使回放缓冲非空），实际 {prefix:?}：{linebuf}"
+    );
 
     // 断连（不消费完 send 的流）——run 仍在推进（idle_timeout 拉到 120s）。
     drop(send_stream);
@@ -592,7 +611,12 @@ async fn resume_endpoint_streams_remainder() {
     assert_eq!(resp.status(), 200);
     let sse = read_sse(resp, Duration::from_secs(10)).await;
     assert!(sse.contains(r#""phase":"end""#), "resume 流应以 lifecycle end 终止：{sse}");
+    // 回放 ∪ 续流 = 全量 8 段。
     for i in 0..8 {
         assert!(sse.contains(&format!("第{i}段。")), "缺少第{i}段：{sse}");
+    }
+    // Fix 1 的负载断言：断连前已 stream 的前缀必须出现在 resume 流里。
+    for d in &prefix {
+        assert!(sse.contains(d), "回放前缀「{d}」未出现在 resume 流：{sse}");
     }
 }
