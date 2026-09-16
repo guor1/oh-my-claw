@@ -32,13 +32,12 @@ pub enum RunSink {
     Conn(mpsc::Sender<Frame>),
     /// 广播（测试断言 / 沿用旧语义）。
     Broadcast(broadcast::Sender<Event>),
-    /// 无状态网关（Detached 客户端）：持有连接发送端——连接活着时事件照常转发，
-    /// 断连后 send 失败被吞掉、仍返回成功，故「send 失败 → 断连」探测失效；
-    /// `closed()` 永久挂起，静默等待期（等模型/审批/ask_user）也不因断连收敛。
+    /// 无状态网关（Detached 客户端）：持有连接发送端 + 事件日志。
     ///
-    /// 供 Web/HTTP 网关使用——run 归属会话而非连接，客户端刷新/断连不中止 run，
-    /// 但连接未断时仍能拿到完整内联事件流（流式回复照常送达）。
-    Detached(mpsc::Sender<Frame>),
+    /// - 连接活着时：事件照常转发（流式完整）；
+    /// - 断连后：`tx.send` 失败被吞掉、仍返回 true，run 继续跑完落库；
+    /// - 所有内联事件同时写入 `log`（回放源），刷新后新连接经它接续剩余流。
+    Detached { tx: mpsc::Sender<Frame>, log: std::sync::Arc<crate::run_log::RunLog> },
 }
 
 impl RunSink {
@@ -51,7 +50,9 @@ impl RunSink {
         match self {
             // Detached：连接活着时正常转发；断连后 send 失败被吞掉、仍返回 true，
             // 不触发 run driver 的「send 失败 → cancel」探测（run 继续跑完落库）。
-            RunSink::Detached(tx) => {
+            // 事件同时写入 log（刷新后接续剩余流的回放源）。
+            RunSink::Detached { tx, log } => {
+                log.push(ev.clone());
                 let _ = tx.send(Frame::Event(ev)).await;
                 true
             }
@@ -74,7 +75,7 @@ impl RunSink {
         match self {
             RunSink::Conn(tx) => tx.closed().await,
             RunSink::Broadcast(_) => std::future::pending().await,
-            RunSink::Detached(_) => std::future::pending().await,
+            RunSink::Detached { .. } => std::future::pending().await,
         }
     }
 }
@@ -82,6 +83,7 @@ impl RunSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run_log::RunLog;
     use oc_proto::{Event, LifecyclePhase, SessionId};
 
     #[tokio::test]
@@ -89,7 +91,7 @@ mod tests {
         // rx 保留（未 drop），tx 未关闭：send 应成功。即便下游断开，Detached 仍吞掉
         // 失败返回 true，故这里也顺带验证「未关闭时正常送达」路径恒成功。
         let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
-        let sink = RunSink::Detached(tx);
+        let sink = RunSink::Detached { tx, log: std::sync::Arc::new(RunLog::new()) };
         let ok = sink
             .send(Event::Lifecycle {
                 session: SessionId::main(),
@@ -98,5 +100,23 @@ mod tests {
             })
             .await;
         assert!(ok, "Detached sink 的 send 必须恒成功，才不会触发断连收敛");
+    }
+
+    #[tokio::test]
+    async fn detached_send_records_into_runlog() {
+        let log = std::sync::Arc::new(RunLog::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let sink = RunSink::Detached { tx, log: log.clone() };
+        let ok = sink
+            .send(Event::Assistant {
+                session: SessionId::main(),
+                run_id: oc_proto::RunId::new("r"),
+                delta: "你".into(),
+            })
+            .await;
+        assert!(ok);
+        let mut sub = log.subscribe(false);
+        let ev = sub.try_recv().expect("sink.send 应写入 RunLog");
+        assert!(matches!(&ev, Event::Assistant { delta, .. } if delta == "你"));
     }
 }

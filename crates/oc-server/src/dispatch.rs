@@ -160,7 +160,10 @@ async fn handle_chat_send(
     // 事件照常转发（流式完整），断连后 send 失败被吞掉、run 继续跑完落库。
     // Interactive 客户端：本轮内联事件定向回发到这条连接（背压不丢，P0-1）。
     let sink = match client_kind {
-        ClientKind::Detached => RunSink::Detached(out_tx.clone()),
+        ClientKind::Detached => RunSink::Detached {
+            tx: out_tx.clone(),
+            log: std::sync::Arc::new(crate::run_log::RunLog::new()),
+        },
         ClientKind::Interactive => RunSink::Conn(out_tx.clone()),
     };
     let mut result = handle.submit(p.text.clone(), sink.clone()).await;
