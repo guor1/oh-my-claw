@@ -37,6 +37,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/sessions/:id/reset", post(sessions::reset))
         .route("/api/v1/sessions/:id/compact", post(sessions::compact))
         .route("/api/v1/chat/send", post(chat::send))
+        .route("/api/v1/chat/resume", get(chat::resume))
         .route("/api/v1/chat/abort", post(chat::abort))
         .route("/api/v1/command", post(command::run))
         .route("/api/v1/approval/reply", post(chat::approval_reply))

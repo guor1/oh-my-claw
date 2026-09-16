@@ -9,8 +9,8 @@ use axum::{
 };
 use futures_util::Stream;
 use oc_proto::{
-    ApprovalReplyParams, ChatAbortParams, ChatSendParams, Event, Frame, LifecyclePhase, Method,
-    MethodOk, RunId, SessionId, UserReplyParams,
+    ApprovalReplyParams, ChatAbortParams, ChatResumeParams, ChatSendParams, Event, Frame,
+    LifecyclePhase, Method, MethodOk, RunId, SessionId, UserReplyParams,
 };
 use serde::Deserialize;
 
@@ -31,6 +31,13 @@ pub struct AbortReq {
     pub run_id: String,
     #[serde(default)]
     pub hard: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ResumeQuery {
+    pub run_id: String,
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// POST /api/v1/chat/send  →  SSE stream of native `Event`s.
@@ -171,6 +178,39 @@ pub async fn abort(
     await_res(&mut conn).await?;
     state.pool.release(conn).await;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /api/v1/chat/resume → SSE：接续一个在途 Detached run 的剩余内联事件流。
+pub async fn resume(
+    AxumState(state): AxumState<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ResumeQuery>,
+) -> HttpResult<AxumResponse> {
+    let session = q
+        .session
+        .as_deref()
+        .map(crate::adapter::validate_session_key)
+        .transpose()?
+        .unwrap_or_else(SessionId::main);
+    let run_id = RunId::new(q.run_id);
+
+    let mut conn = state.pool.acquire().await?;
+    handshake(&mut conn).await?;
+    send_req(
+        &mut conn,
+        Method::ChatResume(ChatResumeParams { session: session.clone(), run_id: run_id.clone() }),
+        None,
+    )
+    .await?;
+    match await_res(&mut conn).await? {
+        MethodOk::ChatResume { .. } => {}
+        other => return Err(HttpError::Protocol(format!("expected chat_resume ok, got {other:?}"))),
+    }
+
+    // 复用 stream_native：按 run_id 过滤，Lifecycle::End/Error 终态停。
+    let stream = stream_native(conn, run_id, session);
+    Ok(Sse::new(stream)
+        .keep_alive(sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response())
 }
 
 #[derive(Deserialize)]

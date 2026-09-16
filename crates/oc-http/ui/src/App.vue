@@ -12,6 +12,7 @@ import {
   startAmbientStream,
   stopAmbientStream,
   activeSessionId,
+  maybeResume,
 } from './lib/state.js'
 
 // 'probing' = 探测中；'login' = 需要登录；'app' = 已认证；'unreachable' = 网关不可达。
@@ -31,10 +32,11 @@ async function bootstrap() {
   }
 }
 
-function start() {
+async function start() {
   startAmbientStream()
   loadSessions()
-  loadHistory(activeSessionId.value)
+  await loadHistory(activeSessionId.value)
+  maybeResume(activeSessionId.value)
 }
 
 // 任何发现"会话已失效"的路径（apiFetch 的 AuthError、EventSource 的 onerror
@@ -62,6 +64,7 @@ onUnmounted(() => {
 async function handleSelectSession(id) {
   activeSessionId.value = id
   await loadHistory(id)
+  maybeResume(id)
 }
 </script>
 

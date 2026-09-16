@@ -6,7 +6,7 @@
  */
 
 import { reactive, shallowReactive } from 'vue'
-import { fetchSessions, fetchHistory, openAmbientStream, handleAuthFailure } from './api.js'
+import { fetchSessions, fetchHistory, openAmbientStream, handleAuthFailure, resumeChat } from './api.js'
 import { createActivity } from './activity.js'
 
 // ── Session list ──────────────────────────────────────────────────────────────
@@ -219,6 +219,10 @@ export function startAmbientStream() {
   closeAmbient = openAmbientStream({
     onStatus(snap) {
       Object.assign(status, snap)
+      // 状态晚到也能接上：若 main 有在途 run 且当前无活跃流，触发一次 resume。
+      if (snap.active_run && activeSessionId.value === 'main' && !activeChats.has('main')) {
+        maybeResume('main')
+      }
     },
     onUsage(ev) {
       if (ev.session === (activeSessionId.value ?? 'main')) {
@@ -265,4 +269,82 @@ const activities = reactive({})
 export function activityFor(sessionId) {
   if (!activities[sessionId]) activities[sessionId] = createActivity()
   return activities[sessionId]
+}
+
+// ── 工具事件渲染（ChatPane 与 maybeResume 共用） ───────────────────────────
+// 与 ChatPane.submit 的 onTool 同构：start 建卡、update 攒输出、end 定格。
+// 唯一抽出到 state.js 的前端重构点，避免两份拷贝。
+export function applyToolEvent(sessionId, ev) {
+  if (ev.phase?.phase === 'start') {
+    // step 边界：定格本 step 的文本气泡（见 ChatPane.submit 的 onTool 注释）。
+    finalizeLastAssistant(sessionId)
+    activityFor(sessionId).visible()
+    appendMessage(sessionId, {
+      id: `tool-${ev.call_id}`,
+      role: 'tool',
+      name: ev.phase.name,
+      args: ev.phase.args ?? '',
+      content: '',
+      output: '',
+      toolStatus: 'running',
+      status: 'running',
+    })
+  } else if (ev.phase?.phase === 'update') {
+    // Stream tool progress into the card's output buffer.
+    const list = messagesFor(sessionId)
+    const m = list.find(x => x.id === `tool-${ev.call_id}`)
+    if (m) {
+      m.output = (m.output ?? '') + (ev.phase.chunk ?? '')
+      m.content = m.output
+    }
+  } else if (ev.phase?.phase === 'end') {
+    const list = messagesFor(sessionId)
+    const m = list.find(x => x.id === `tool-${ev.call_id}`)
+    if (m) {
+      m.toolStatus = ev.phase.status
+      m.status = ev.phase.status
+    }
+    activityFor(sessionId).toolEnd(Date.now())
+  }
+}
+
+/**
+ * 刷新后若 main 会话有在途 run，则接续其剩余流，渲染进当前消息列表。
+ * 复用 ChatPane 的渲染回调（onDelta/onTool/onReasoning/onEnd），
+ * 回放与续流对渲染透明。
+ */
+export function maybeResume(sessionId) {
+  if (sessionId !== 'main') return
+  const rid = status.active_run
+  if (!rid) return
+  if (activeChats.has(sessionId)) return   // 已有流在跑，不重复挂
+
+  const target = sessionId
+  const act = activityFor(target)
+  act.arm(Date.now())
+
+  const ctrl = resumeChat({
+    session: target,
+    runId: rid,
+    onReasoning(delta) { act.reasoning(delta, Date.now()) },
+    onDelta(delta) {
+      act.visible()
+      updateLastAssistant(target, delta)
+    },
+    onTool(ev) {
+      // 与 ChatPane.submit 的 onTool 同构：start 建卡、update 攒输出、end 定格。
+      applyToolEvent(target, ev)
+    },
+    onEnd() {
+      act.end()
+      finalizeLastAssistant(target)
+      clearActiveChatCtrl(target)
+    },
+    onError(msg) {
+      act.end()
+      finalizeLastAssistant(target)
+      clearActiveChatCtrl(target)
+    },
+  })
+  setActiveChatCtrl(target, ctrl)
 }

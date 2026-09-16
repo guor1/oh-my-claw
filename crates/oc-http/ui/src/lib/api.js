@@ -254,6 +254,51 @@ export function sendChat(opts) {
   }
 }
 
+/**
+ * 接续一个在途 run 的剩余流（回放 + 续流），回调签名与 sendChat 一致
+ * （无 onAccepted——run_id 由调用方已知）。返回 controller，abort() 只断流、不发 abort。
+ */
+export function resumeChat({ session, runId, onDelta, onReasoning, onTool, onEnd, onError }) {
+  const ctrl = new AbortController()
+  ;(async () => {
+    try {
+      const resp = await apiFetch(
+        `/api/v1/chat/resume?run_id=${encodeURIComponent(runId)}&session=${encodeURIComponent(session)}`,
+        { signal: ctrl.signal, headers: { Accept: 'text/event-stream' } },
+      )
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const frames = buf.split('\n\n')
+        buf = frames.pop() ?? ''
+        for (const frame of frames) {
+          const eventLine = frame.match(/^event: (.+)$/m)?.[1]?.trim()
+          const dataLine = frame.match(/^data: (.+)$/m)?.[1]?.trim()
+          if (!dataLine) continue
+          let data
+          try { data = JSON.parse(dataLine) } catch (_) { continue }
+          switch (eventLine) {
+            case 'assistant': onDelta?.(data.delta ?? ''); break
+            case 'reasoning': onReasoning?.(data.delta ?? ''); break
+            case 'tool': onTool?.(data); break
+            case 'lifecycle':
+              if (data.phase?.phase === 'end') { onEnd?.(); return }
+              if (data.phase?.phase === 'error') { onError?.(data.phase.message ?? 'run failed'); return }
+              break
+          }
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') onError?.(err.message)
+    }
+  })()
+  return { abort: () => ctrl.abort() }
+}
+
 // ── Replies ───────────────────────────────────────────────────────────────────
 
 export async function approvalReply(approvalId, allow) {

@@ -62,6 +62,22 @@ fn event_names(sse: &str) -> Vec<String> {
         .collect()
 }
 
+/// 持续吐字：每 `gap` 一段共 `n` 段，末段 Done(Stop)。断连发生在中途时，
+/// 剩余段证明 run 仍在推进、且 resume 能接续回来。
+fn streaming_reply(n: usize, gap: Duration) -> Vec<ScriptStep> {
+    let mut steps: Vec<_> = (0..n)
+        .map(|i| ScriptStep {
+            delay: gap,
+            delta: Delta::Text(format!("第{i}段。")),
+        })
+        .collect();
+    steps.push(ScriptStep {
+        delay: Duration::ZERO,
+        delta: Delta::Done(FinishReason::Stop),
+    });
+    steps
+}
+
 /// chat/send 应流式返回，首事件给 run_id，末事件是 lifecycle end。
 #[tokio::test]
 async fn chat_send_streams_accepted_then_deltas_then_end() {
@@ -514,4 +530,69 @@ async fn chat_send_streams_reasoning_events() {
     assert!(names.iter().any(|n| n == "reasoning"), "SSE 应含 reasoning 事件，实际：{names:?}");
     assert!(body.contains("先想想"), "reasoning 正文应透传，实际：{body}");
     assert!(body.contains(r#""event":"reasoning""#), "data 里应带 event 标签：{body}");
+}
+
+/// Detached run 断连后，GET /api/v1/chat/resume 拉回剩余流到终态。
+#[tokio::test]
+async fn resume_endpoint_streams_remainder() {
+    use oc_server::testing::SessionConfigExt;
+
+    let daemon = TestDaemon::builder(
+        "nat-resume",
+        Arc::new(MockProvider::scripted(streaming_reply(
+            8,
+            Duration::from_millis(150),
+        ))),
+    )
+    .map_cfg(|c| c.with_idle_timeout(Duration::from_secs(120)))
+    .start()
+    .await;
+    let base = spawn_gateway(daemon.transport(), 4).await;
+    let client = reqwest::Client::new();
+
+    // 发消息（经 /api/v1/chat/send），从首帧 accepted 解析 run_id 后立刻断连。
+    let mut send_stream = client
+        .post(format!("{base}/api/v1/chat/send"))
+        .json(&serde_json::json!({ "session": "main", "text": "讲个故事" }))
+        .send()
+        .await
+        .expect("send 应建立")
+        .bytes_stream();
+
+    let mut buf = String::new();
+    let mut run_id = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while run_id.is_none() && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), send_stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                for line in buf.lines() {
+                    let Some(p) = line.strip_prefix("data: ") else { continue };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(p.trim()) else { continue };
+                    if let Some(id) = v.get("run_id").and_then(|i| i.as_str()) {
+                        run_id = Some(id.to_string());
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let run_id = run_id.unwrap_or_else(|| panic!("未能取到 run_id：{buf}"));
+
+    // 断连（不消费完 send 的流）——run 仍在推进（idle_timeout 拉到 120s）。
+    drop(send_stream);
+
+    // resume 拉剩余流。
+    let resp = client
+        .get(format!("{base}/api/v1/chat/resume?run_id={run_id}&session=main"))
+        .send()
+        .await
+        .expect("resume 应建立");
+    assert_eq!(resp.status(), 200);
+    let sse = read_sse(resp, Duration::from_secs(10)).await;
+    assert!(sse.contains(r#""phase":"end""#), "resume 流应以 lifecycle end 终止：{sse}");
+    for i in 0..8 {
+        assert!(sse.contains(&format!("第{i}段。")), "缺少第{i}段：{sse}");
+    }
 }

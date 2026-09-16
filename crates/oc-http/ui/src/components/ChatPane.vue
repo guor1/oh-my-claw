@@ -21,6 +21,7 @@ import {
   loadHistory,
   activeSessionId,
   activityFor,
+  applyToolEvent,
 } from '../lib/state.js'
 
 const props = defineProps({
@@ -105,40 +106,12 @@ function submit() {
       updateLastAssistant(target, delta)
     },
     onTool(ev) {
+      // 建卡/更新/定格逻辑抽到 state.js 的 applyToolEvent（与 maybeResume 共用）；
+      // waitTimers 是组件局部状态，留在这里。
+      applyToolEvent(target, ev)
       if (ev.phase?.phase === 'start') {
-        // step 边界：定格本 step 的文本气泡，否则下一 step 的文本会被
-        // updateLastAssistant 的 findLast(pending) 追加进**这一条**里——它的位置
-        // 在后续 ToolCard 之前，于是最终回答会显示在工具卡上方（刷新后才正常，
-        // 因为 loadHistory 按 seq 重建）。
-        finalizeLastAssistant(target)
-        activityFor(target).visible()
         clearTimeout(waitTimers.get(target))
-        appendMessage(target, {
-          id: `tool-${ev.call_id}`,
-          role: 'tool',
-          name: ev.phase.name,
-          args: ev.phase.args ?? '',
-          content: '',
-          output: '',
-          toolStatus: 'running',
-          status: 'running',
-        })
-      } else if (ev.phase?.phase === 'update') {
-        // Stream tool progress into the card's output buffer.
-        const list = messagesFor(target)
-        const m = list.find(x => x.id === `tool-${ev.call_id}`)
-        if (m) {
-          m.output = (m.output ?? '') + (ev.phase.chunk ?? '')
-          m.content = m.output
-        }
       } else if (ev.phase?.phase === 'end') {
-        const list = messagesFor(target)
-        const m = list.find(x => x.id === `tool-${ev.call_id}`)
-        if (m) {
-          m.toolStatus = ev.phase.status
-          m.status = ev.phase.status
-        }
-        activityFor(target).toolEnd(Date.now())
         scheduleWait(target)
       }
     },
