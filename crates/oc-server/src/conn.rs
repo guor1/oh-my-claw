@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use oc_proto::{Frame, Res};
+use oc_proto::{Frame, Method, Res};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -84,10 +84,17 @@ async fn read_loop<R>(
 where
     R: AsyncReadExt + Unpin,
 {
+    // 连接级客户端类型：Connect 握手帧确定，此后本连接所有 chat.send 沿用。
+    // 缺省 Interactive——旧客户端或漏发字段时保持原有断连语义。
+    let mut client_kind = oc_proto::ClientKind::Interactive;
     while let Some(frame) = reader.read_frame().await? {
         match frame {
             Frame::Req(req) => {
-                let result = dispatch::handle_req(&req, state, out_tx).await;
+                if let Method::Connect(p) = &req.method {
+                    client_kind = p.client_kind;
+                }
+                let result =
+                    dispatch::handle_req(&req, state, out_tx, client_kind).await;
                 let res = Res {
                     id: req.id,
                     result,

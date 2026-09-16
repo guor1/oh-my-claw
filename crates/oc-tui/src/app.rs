@@ -8,8 +8,8 @@ use anyhow::Result;
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use oc_proto::{
-    ChatSendParams, CommandParams, ConnectParams, Event, Frame, LifecyclePhase, Method, Req, ReqId,
-    ResResult, RunId, SessionId, PROTO_VERSION,
+    ChatSendParams, ClientKind, CommandParams, ConnectParams, Event, Frame, LifecyclePhase, Method,
+    Req, ReqId, ResResult, RunId, SessionId, PROTO_VERSION,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -77,6 +77,7 @@ impl App {
             method: Method::Connect(ConnectParams {
                 proto_version: PROTO_VERSION,
                 token: None,
+                client_kind: ClientKind::Interactive,
             }),
             idempotency_key: None,
         };

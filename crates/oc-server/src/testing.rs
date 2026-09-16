@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use oc_llm::provider::Provider;
 use oc_proto::{
-    ChatSendParams, ConnectParams, Event, Frame, LifecyclePhase, Method, Req, ReqId, ResResult,
-    SessionId, PROTO_VERSION,
+    ChatSendParams, ClientKind, ConnectParams, Event, Frame, LifecyclePhase, Method, Req, ReqId,
+    ResResult, SessionId, PROTO_VERSION,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -427,12 +427,18 @@ impl TestClient {
         id
     }
 
-    /// `connect` 握手，断言 hello 成功。
+    /// `connect` 握手，断言 hello 成功（默认 Interactive，保持既有测试语义）。
     pub async fn handshake(&mut self) {
+        self.handshake_as(ClientKind::Interactive).await;
+    }
+
+    /// `connect` 握手，指定客户端类型。Detached 用例用它模拟 Web/HTTP 网关。
+    pub async fn handshake_as(&mut self, client_kind: ClientKind) {
         let id = self
             .request(Method::Connect(ConnectParams {
                 proto_version: PROTO_VERSION,
                 token: None,
+                client_kind,
             }))
             .await;
         match self.recv().await {

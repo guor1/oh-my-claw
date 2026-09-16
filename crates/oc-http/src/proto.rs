@@ -1,13 +1,15 @@
 //! Shared daemon protocol helpers used by both OpenAI and native adapters.
 
-use oc_proto::{ConnectParams, Frame, IdemKey, Method, MethodOk, Req, ReqId, ResResult, PROTO_VERSION};
+use oc_proto::{
+    ClientKind, ConnectParams, Frame, IdemKey, Method, MethodOk, Req, ReqId, ResResult, PROTO_VERSION,
+};
 
 use crate::conn_pool::NdjsonConn;
 use crate::error::{HttpError, HttpResult};
 
 /// Perform the `connect` handshake on a fresh connection.
 pub(crate) async fn handshake(conn: &mut NdjsonConn) -> HttpResult<()> {
-    send_req(conn, Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None }), None).await?;
+    send_req(conn, Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None, client_kind: ClientKind::Detached }), None).await?;
     match await_res(conn).await? {
         MethodOk::Hello { .. } => Ok(()),
         other => Err(HttpError::Protocol(format!("expected hello, got {other:?}"))),

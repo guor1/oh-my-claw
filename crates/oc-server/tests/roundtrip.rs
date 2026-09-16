@@ -4,7 +4,7 @@
 //! 双平台各验一次（cfg 分派 client 连接），对应 M2 硬验收。
 
 use oc_proto::{
-    ChatSendParams, ConnectParams, Frame, LifecyclePhase, Method, Req, ReqId, ResResult,
+    ChatSendParams, ClientKind, ConnectParams, Frame, LifecyclePhase, Method, Req, ReqId, ResResult,
     PROTO_VERSION,
 };
 use oc_server::TransportKind;
@@ -82,7 +82,7 @@ async fn connect_and_echo_roundtrip() {
     // 1) connect → hello
     send(&mut w, &Frame::Req(Req {
         id: ReqId::new("c0"),
-        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None }),
+        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None, client_kind: ClientKind::Interactive }),
         idempotency_key: None,
     })).await;
 
@@ -160,7 +160,7 @@ async fn sessions_list_roundtrip() {
     // connect（registry 预建 main 会话）。
     send(&mut w, &Frame::Req(Req {
         id: ReqId::new("c0"),
-        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None }),
+        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None, client_kind: ClientKind::Interactive }),
         idempotency_key: None,
     })).await;
     let _ = recv(&mut reader).await;
@@ -216,7 +216,7 @@ async fn diagnostics_roundtrip() {
 
     send(&mut w, &Frame::Req(Req {
         id: ReqId::new("c0"),
-        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None }),
+        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None, client_kind: ClientKind::Interactive }),
         idempotency_key: None,
     })).await;
     let _ = recv(&mut reader).await;

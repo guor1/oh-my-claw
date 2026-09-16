@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use oc_proto::{
-    ChatAbortParams, ChatSendParams, ConnectParams, Features, Frame, Method, MethodOk, ProtoError,
-    Req, ResResult, SessionId, Snapshot, PROTO_VERSION,
+    ChatAbortParams, ChatSendParams, ClientKind, ConnectParams, Features, Frame, Method, MethodOk,
+    ProtoError, Req, ResResult, SessionId, Snapshot, PROTO_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -18,7 +18,12 @@ use crate::state::ServerState;
 ///
 /// `out_tx`：本连接的出站帧队列——`chat.send` 用它构造 per-run sink，
 /// 让本轮内联事件（文本/工具/审批）背压式定向回发到这条连接（P0-1）。
-pub async fn handle_req(req: &Req, state: &Arc<ServerState>, out_tx: &mpsc::Sender<Frame>) -> ResResult {
+pub async fn handle_req(
+    req: &Req,
+    state: &Arc<ServerState>,
+    out_tx: &mpsc::Sender<Frame>,
+    client_kind: ClientKind,
+) -> ResResult {
     // 幂等：side-effecting 方法命中缓存直接返回首个结果。
     if let Some(key) = &req.idempotency_key {
         if let Some(ok) = state.idem_get(key) {
@@ -28,7 +33,7 @@ pub async fn handle_req(req: &Req, state: &Arc<ServerState>, out_tx: &mpsc::Send
 
     let result = match &req.method {
         Method::Connect(p) => handle_connect(p, state),
-        Method::ChatSend(p) => handle_chat_send(p, state, out_tx).await,
+        Method::ChatSend(p) => handle_chat_send(p, state, out_tx, client_kind).await,
         Method::ChatAbort(p) => handle_chat_abort(p, state).await,
         Method::ApprovalReply(p) => {
             state.resolve_approval(&p.approval_id, p.allow);
@@ -146,12 +151,17 @@ async fn handle_chat_send(
     p: &ChatSendParams,
     state: &Arc<ServerState>,
     out_tx: &mpsc::Sender<Frame>,
+    client_kind: ClientKind,
 ) -> Result<MethodOk, ProtoError> {
     // 缺省路由到 main；未知 id 由 registry 懒创建（隐式建会话）。
     let session = p.session.clone().unwrap_or_else(SessionId::main);
     let handle = state.registry().get_or_spawn(&session);
-    // 本轮内联事件定向回发到这条连接（背压不丢，P0-1）。
-    let sink = RunSink::Conn(out_tx.clone());
+    // Detached 网关（Web/HTTP）：run 归属会话而非连接，断连不中止；
+    // Interactive 客户端：本轮内联事件定向回发到这条连接（背压不丢，P0-1）。
+    let sink = match client_kind {
+        ClientKind::Detached => RunSink::Detached,
+        ClientKind::Interactive => RunSink::Conn(out_tx.clone()),
+    };
     let mut result = handle.submit(p.text.clone(), sink.clone()).await;
 
     // 拿到句柄后、submit 前，该 actor 可能刚被空闲淘汰（P2-3 的 GC 落在这个缝里）。

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oc_llm::mock::MockProvider;
-use oc_proto::{Frame, Method, MethodOk, Req, ReqId, ResResult, SessionId, Snapshot};
+use oc_proto::{ClientKind, Frame, Method, MethodOk, Req, ReqId, ResResult, SessionId, Snapshot};
 use oc_server::testing::{test_cfg, test_state, SessionConfigExt};
 use oc_server::ServerState;
 use oc_tools::process::BackgroundHandoff;
@@ -27,7 +27,7 @@ async fn status(state: &Arc<ServerState>) -> Snapshot {
         method: Method::Status,
         idempotency_key: None,
     };
-    match oc_server::dispatch::handle_req(&req, state, &out_tx).await {
+    match oc_server::dispatch::handle_req(&req, state, &out_tx, ClientKind::Interactive).await {
         ResResult::Ok(MethodOk::Status(s)) => s,
         other => panic!("期望 Status 应答，得到 {other:?}"),
     }

@@ -13,7 +13,7 @@ use std::time::Duration;
 use oc_llm::mock::{MockProvider, ScriptStep};
 use oc_llm::{Delta, FinishReason};
 use oc_proto::{
-    ChatSendParams, ConnectParams, Frame, LifecyclePhase, Method, Req, ReqId, ResResult,
+    ChatSendParams, ClientKind, ConnectParams, Frame, LifecyclePhase, Method, Req, ReqId, ResResult,
     PROTO_VERSION,
 };
 use oc_server::TransportKind;
@@ -100,7 +100,7 @@ async fn long_reply_not_truncated() {
     // connect → hello
     send(&mut w, &Frame::Req(Req {
         id: ReqId::new("c0"),
-        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None }),
+        method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None, client_kind: ClientKind::Interactive }),
         idempotency_key: None,
     })).await;
     let _ = recv(&mut reader).await;

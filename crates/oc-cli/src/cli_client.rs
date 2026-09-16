@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use oc_proto::{
-    ConnectParams, Frame, Method, MethodOk, Req, ReqId, ResResult, PROTO_VERSION,
+    ClientKind, ConnectParams, Frame, Method, MethodOk, Req, ReqId, ResResult, PROTO_VERSION,
 };
 use oc_tui::client::{ClientTransport, ConnectTo};
 
@@ -23,7 +23,11 @@ async fn connect() -> Result<ClientTransport> {
     client
         .send(&Frame::Req(Req {
             id: ReqId::new("connect-0"),
-            method: Method::Connect(ConnectParams { proto_version: PROTO_VERSION, token: None }),
+            method: Method::Connect(ConnectParams {
+                proto_version: PROTO_VERSION,
+                token: None,
+                client_kind: ClientKind::Interactive,
+            }),
             idempotency_key: None,
         }))
         .await?;
