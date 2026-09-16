@@ -31,7 +31,7 @@
                     └───────────────────────────────────────────────────────────────────────┘
                             ▲  RunLog（每 Detached run 一个）
                             │  - 环形缓冲 VecDeque<Event>（cap 1024）
-                            │  - Notify 唤醒信号
+                            │  - 订阅者列表（live forward 任务）
                             │
   run driver ───────────────┘  所有内联事件经 RunSink::send() 单漏斗 push 进 RunLog
 ```
@@ -40,23 +40,30 @@
 
 ## 1. RunLog（每 Detached run 一个）
 
-新模块 `crates/oc-server/src/run_log.rs`：
+新模块 `crates/oc-server/src/run_log.rs`。**订阅者模式**（而非 Notify 轮询），避免「drain 后、挂等待前」的 lost-wakeup 竞态：
 
 ```rust
 pub struct RunLog {
-    buf: Mutex<VecDeque<Event>>,   // 环形缓冲，cap 1024，满则 pop_front 丢最旧
-    notify: Notify,
+    inner: Mutex<Inner>,
+}
+struct Inner {
+    buf: VecDeque<Event>,                                  // 环形缓冲，cap 1024
+    subs: Vec<mpsc::UnboundedSender<Event>>,               // live 订阅者（resume forward 任务）
 }
 
 impl RunLog {
-    pub fn push(&self, ev: Event);              // 生产者：push + notify_one
-    pub async fn drain_after(&self, cursor) -> Vec<Event>;  // 读缓冲（回放用）
-    pub async fn wait_after(&self, cursor) -> ...;          // 挂 Notify 等新事件（续流用）
+    pub fn new() -> Self;
+    /// 生产者：入缓冲（满则丢最旧）+ 转发给所有 live 订阅者。
+    pub fn push(&self, ev: Event);
+    /// 订阅：先按序回放缓冲（`replay_reasoning=false` 时过滤 Reasoning），
+    /// 再把订阅者登记进 subs。**全程持锁**——回放与订阅之间不丢事件。
+    pub fn subscribe(&self, replay_reasoning: bool) -> mpsc::UnboundedReceiver<Event>;
 }
 ```
 
-- **cap=1024**：回放可能从中间开始（丢最旧），但完整文本最终由落库历史兜底，回放只是过渡。
-- **单锁 + Notify**：回放与续流之间无缝隙——同一把锁内「读缓冲 + 挂等待」，生产者 push 也持同一把锁，不丢不重（见第 4 节 forward 任务）。
+- **cap=1024**：回放可能从中间开始（丢最旧），完整文本最终由落库历史兜底。
+- **不丢不重**：`subscribe` 在同一把锁内「回放 + 登记订阅者」；`push` 也持同一把锁「入缓冲 + 广播」——二者互斥，回放与续流之间无缝隙。
+- 订阅者通道 `UnboundedSender`：forward 任务即时转发到 resume 连接的出站队列（bounded 256，`send().await` 背压），慢客户端由 out_tx 背压反向抑制，不会无限堆积。
 - `Event` 已 `Clone`（`event.rs:13`），缓冲存 `Event` 值即可。
 
 ## 2. RunSink::Detached 扩展
@@ -71,21 +78,10 @@ pub enum RunSink {
 }
 ```
 
-`send()` 的 Detached 分支：
-
-```rust
-RunSink::Detached { tx, log } => {
-    log.push(ev.clone());                      // 先入缓冲（回放 + 续流的源）
-    let _ = tx.send(Frame::Event(ev)).await;   // 再转发到原连接（连上则流式照常）
-    true                                        // 断连吞失败，恒 true
-}
-```
-
-> **reasoning 必须进缓冲**：forward 任务的「续流」阶段从缓冲经 Notify 取新事件，若 reasoning 不入缓冲，「后续 thinking 照常续」就送不到。reasoning 的「只续不补」由 forward 任务的**回放阶段过滤**实现，而非在入口丢弃（见第 4 节）。
-
-**收益**：所有内联事件（`run.rs` 的 `emit_inline`、`tools_bridge.rs` 的 tool-update pump）本就走 `sink.send()`，于是 RunLog 的写入集中在 sink 这一个漏斗，**run.rs 的每个 emit 点零改动**。
-
-**开销**：`RunSink::Conn`（交互式路径）不带 RunLog，`Clone`/`send` 零额外成本；只有 Detached 路径多一次 `push`。
+- `send()` 的 Detached 分支：`log.push(ev.clone())`（入缓冲 + 转发 live 订阅者），再 `tx.send(Frame::Event(ev)).await` 到原连接，恒返回 `true`。
+- **收益**：所有内联事件（`run.rs` 的 `emit_inline`、`tools_bridge.rs` 的 tool-update pump）本就走 `sink.send()`，于是 RunLog 的写入集中在 sink 这一个漏斗，**run.rs 的每个 emit 点零改动**。
+- **reasoning 必须进缓冲**：续流阶段经 RunLog 订阅取新事件，reasoning 不入缓冲则「后续 thinking 照常续」送不到；「只续不补」由 `subscribe(replay_reasoning=false)` 在回放阶段过滤实现。
+- **开销**：`RunSink::Conn`（交互式路径）不带 RunLog，零额外成本；只有 Detached 路径多一次 `push`。
 
 ## 3. 协议层（proto）
 
@@ -130,12 +126,11 @@ pub enum MethodOk {
 - `SessionHandle::resume(run_id, out_tx) -> bool`：`tx.send(SessionCmd::Resume{..})` 后收 oneshot。
 - actor 处理 `Resume`：
   1. `run_logs.get(&run_id)`；取不到 → `reply.send(false)`。
-  2. 取到 → spawn **forward 任务**，`reply.send(true)`。
-- **forward 任务**（`session.rs` 内私有函数或 `run_log.rs` 提供）：
-  1. 回放：按序读 RunLog 缓冲，**过滤掉 `Event::Reasoning`**（只续不补），逐条 `out_tx.send(Frame::Event(ev))`。
-  2. 续流：挂 RunLog 的 Notify 等新事件，逐条转发（**含 Reasoning**）。
-  3. 收到 `Event::Lifecycle { phase: End | Error }` 即停、任务退出。
-  4. 出站 send 失败（客户端又断）→ 退出，`Arc<RunLog>` drop。
+  2. 取到 → `run_log.subscribe(/* replay_reasoning */ false)` 拿订阅者 receiver，spawn **forward 任务**，`reply.send(true)`。
+- **forward 任务**（`session.rs` 内私有函数）：
+  1. `receiver.recv()` 循环，逐条 `out_tx.send(Frame::Event(ev)).await`（回放阶段已过滤 reasoning，receiver 里只有要发的事件 + 续流的 reasoning）。
+  2. 收到 `Event::Lifecycle { phase: End | Error }` 即停、任务退出。
+  3. 出站 send 失败（客户端又断）→ 退出，`Arc<RunLog>` drop。
 
 ## 5. 生命周期 / 清理
 
@@ -178,8 +173,8 @@ pub enum MethodOk {
 
 | 层 | 用例 |
 |----|------|
-| 单元（run_log） | push/pop 顺序；cap 满丢最旧；drain 后 wait 只拿增量（不丢不重） |
-| 单元（resume 语义） | 回放按序 + 过滤 Reasoning（回放阶段） |
+| 单元（run_log） | push 入缓冲顺序；cap 满丢最旧；subscribe 回放按序 + 不丢不重（回放与 live 订阅之间无缝隙） |
+| 单元（resume 语义） | subscribe(replay_reasoning=false) 回放过滤 Reasoning；live 订阅含 Reasoning |
 | 集成（oc-server） | Detached run 中途断连 → 新连接 `ChatResume` → 收到回放 ∪ 续流到 End，且两者拼接 = 全量 |
 | 集成（oc-server） | resume 不存在的 run_id → 协议错误 |
 | e2e（oc-http） | `GET /api/v1/chat/resume` 拉回剩余流到终态 |
