@@ -30,6 +30,12 @@ pub enum RunSink {
     Conn(mpsc::Sender<Frame>),
     /// 广播（测试断言 / 沿用旧语义）。
     Broadcast(broadcast::Sender<Event>),
+    /// 无连接归属（Detached 客户端）：事件静默丢弃、`closed()` 永不触发。
+    ///
+    /// 供 Web/HTTP 网关使用——run 归属会话而非连接，客户端刷新/断连不中止 run。
+    /// `send` 恒真所以「send 失败 → 断连」探测失效，`closed` 永久挂起所以
+    /// 静默等待期（等模型/审批/ask_user）也不会因断连收敛。
+    Detached,
 }
 
 impl RunSink {
@@ -40,6 +46,7 @@ impl RunSink {
     /// `select!` 叠加 cancel，使背压期间仍能响应 abort/看门狗（见 run.rs）。
     pub async fn send(&self, ev: Event) -> bool {
         match self {
+            RunSink::Detached => true,
             RunSink::Conn(tx) => tx.send(Frame::Event(ev)).await.is_ok(),
             // 广播 send 仅在无接收端时 Err；测试里接收端一直在，视为始终可达。
             RunSink::Broadcast(tx) => {
@@ -59,6 +66,26 @@ impl RunSink {
         match self {
             RunSink::Conn(tx) => tx.closed().await,
             RunSink::Broadcast(_) => std::future::pending().await,
+            RunSink::Detached => std::future::pending().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_proto::{Event, LifecyclePhase, SessionId};
+
+    #[tokio::test]
+    async fn detached_send_always_succeeds() {
+        let sink = RunSink::Detached;
+        let ok = sink
+            .send(Event::Lifecycle {
+                session: SessionId::main(),
+                run_id: oc_proto::RunId::new("run"),
+                phase: LifecyclePhase::Start,
+            })
+            .await;
+        assert!(ok, "Detached sink 的 send 必须恒成功，才不会触发断连收敛");
     }
 }
