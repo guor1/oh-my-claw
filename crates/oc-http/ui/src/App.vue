@@ -1,21 +1,62 @@
 <script setup>
-import { onMounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import SessionSidebar from './components/SessionSidebar.vue'
 import ChatPane from './components/ChatPane.vue'
 import StatusBar from './components/StatusBar.vue'
 import Notification from './components/Notification.vue'
+import LoginGate from './components/LoginGate.vue'
+import { probeAuth, AUTH_OK, AUTH_REQUIRED } from './lib/api.js'
 import {
   loadSessions,
   loadHistory,
   startAmbientStream,
+  stopAmbientStream,
   activeSessionId,
 } from './lib/state.js'
 
-onMounted(async () => {
+// 'probing' = 探测中；'login' = 需要登录；'app' = 已认证；'unreachable' = 网关不可达。
+const phase = ref('probing')
+
+async function bootstrap() {
+  // 三态探测：只有明确的 200/401 才算结论。5xx / 传输失败既不能当成"已认证"
+  // （那样会进主界面然后连环报错），也不能让它抛出（那样会白屏）。
+  const state = await probeAuth()
+  if (state === AUTH_REQUIRED) {
+    phase.value = 'login'
+  } else if (state === AUTH_OK) {
+    phase.value = 'app'
+    start()
+  } else {
+    phase.value = 'unreachable'
+  }
+}
+
+function start() {
   startAmbientStream()
-  await loadSessions()
-  // Bootstrap history for the default session immediately.
-  await loadHistory(activeSessionId.value)
+  loadSessions()
+  loadHistory(activeSessionId.value)
+}
+
+// 任何发现"会话已失效"的路径（apiFetch 的 AuthError、EventSource 的 onerror
+// 探测、main.js 的 errorHandler）都汇到这里，是登录态失效的唯一出口。
+function onAuthRequired() {
+  // 先停掉 ambient 流：否则它会在登录页背后一直重连、反复发未鉴权请求。
+  stopAmbientStream()
+  phase.value = 'login'
+}
+
+function onLoggedIn() {
+  phase.value = 'app'
+  start()
+}
+
+onMounted(() => {
+  window.addEventListener('oc:auth-required', onAuthRequired)
+  bootstrap()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('oc:auth-required', onAuthRequired)
 })
 
 async function handleSelectSession(id) {
@@ -25,13 +66,24 @@ async function handleSelectSession(id) {
 </script>
 
 <template>
-  <div class="app">
+  <LoginGate v-if="phase === 'login'" @authed="onLoggedIn" />
+
+  <div v-else-if="phase === 'app'" class="app">
     <SessionSidebar @select="handleSelectSession" />
     <main class="main">
       <ChatPane :session-id="activeSessionId.value" />
       <StatusBar />
     </main>
   </div>
+
+  <!-- 网关不可达：明说原因并给重试，而不是留一片白屏。 -->
+  <main v-else-if="phase === 'unreachable'" class="fallback">
+    <div class="fallback-card">
+      <h1 class="fallback-title">连不上网关</h1>
+      <p class="fallback-sub">daemon 可能没在运行，或 HTTP 网关已停止。启动后重试。</p>
+      <button class="fallback-retry" @click="bootstrap">重试</button>
+    </div>
+  </main>
 
   <Notification />
 </template>
@@ -56,6 +108,7 @@ async function handleSelectSession(id) {
   --accent-hover: hsl(var(--accent-h) 80% 44%);
   --accent-muted: hsl(var(--accent-h) 60% 70%);
   --accent-bg:    hsl(var(--accent-h) 80% 96%);
+  --accent-ring:  hsl(var(--accent-h) 80% 52% / 0.35);
 
   /* Semantic */
   --success: hsl(150 60% 38%);
@@ -81,6 +134,9 @@ async function handleSelectSession(id) {
   --sp-4: 16px;
   --sp-5: 24px;
   --sp-6: 32px;
+
+  /* Typography */
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -141,5 +197,47 @@ textarea:focus-visible {
   grid-template-rows: 1fr auto;
   overflow: hidden;
   border-left: 1px solid var(--border);
+}
+
+/* 网关不可达时的兜底屏，与 LoginGate 同一套卡片语言。 */
+.fallback {
+  height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: var(--sp-5);
+}
+
+.fallback-card {
+  width: min(380px, 100%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--sp-6);
+  text-align: center;
+}
+
+.fallback-title {
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.fallback-sub {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-top: var(--sp-2);
+}
+
+.fallback-retry {
+  margin-top: var(--sp-4);
+  padding: var(--sp-2) var(--sp-5);
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border-radius: var(--r-sm);
+}
+
+.fallback-retry:hover {
+  background: var(--accent-hover);
 }
 </style>

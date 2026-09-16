@@ -1,8 +1,9 @@
-//! 静态资源与 token 注入：/ 服务内嵌 Vue bundle。
+//! 静态资源：/ 服务内嵌 Vue bundle。
 //!
 //! 编译期经 rust-embed 嵌入 `ui/dist`（含 hashed assets，已提交），release
-//! 二进制自包含，无需 Node。服务端把 `--token` 注入 index.html 的
-//! `window.__OC_TOKEN__`，浏览器拿到即可带 Bearer 调 `/api/v1/*`。
+//! 二进制自包含，无需 Node。页面加载后由前端调用 `/auth/login` 换取
+//! HttpOnly 会话 cookie，再带 cookie 调 `/api/v1/*`——token 本身不再注入
+//! index.html，避免被任何能访问 `/` 的未授权客户端读走。
 
 use axum::{
     extract::State as AxumState,
@@ -19,17 +20,6 @@ use crate::server::AppState;
 #[folder = "$CARGO_MANIFEST_DIR/ui/dist"]
 struct Assets;
 
-/// index.html 里的占位符，serve 时替换为实际 token。
-///
-/// 值用 `__OC_TOKEN_VALUE__`（而非与变量名相同的 `__OC_TOKEN__`），否则
-/// `String::replace` 会连变量名 `window.__OC_TOKEN__` 里的那段一起替换，
-/// 把脚本改成 `window.s3cret = "s3cret"` 这种报废代码。
-///
-/// 页面加载即拿到 token，免去用户手贴。安全的前提是：能到达这个 handler 的
-/// 请求，要么已带正确 token（非 loopback），要么本就是 loopback 连接（无鉴权
-/// 模式）——注入不会把 token 泄露给未授权的第三方。
-const TOKEN_PLACEHOLDER: &str = "__OC_TOKEN_VALUE__";
-
 /// Web UI 路由：`/` 加任意 bundle 资源路径。
 ///
 /// 用 fallback 而非逐文件注册，SPA 自己管客户端路由：未知路径回 index.html，
@@ -40,11 +30,11 @@ pub fn routes() -> Router<AppState> {
         .fallback(get(serve_asset))
 }
 
-async fn index(AxumState(state): AxumState<AppState>) -> Response {
-    serve_path("index.html", state.token.as_deref())
+async fn index(AxumState(_state): AxumState<AppState>) -> Response {
+    serve_path("index.html")
 }
 
-async fn serve_asset(AxumState(state): AxumState<AppState>, uri: Uri) -> Response {
+async fn serve_asset(AxumState(_state): AxumState<AppState>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     // API 路径绝不回退 index.html：那儿的 404 就该是 404，不能返回 HTML
     // 让 fetch() 调用方解析失败。
@@ -52,26 +42,36 @@ async fn serve_asset(AxumState(state): AxumState<AppState>, uri: Uri) -> Respons
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     if Assets::get(path).is_some() {
-        serve_path(path, state.token.as_deref())
+        serve_path(path)
     } else {
         // SPA 深链：交还应用外壳，让客户端路由接管。
-        serve_path("index.html", state.token.as_deref())
+        serve_path("index.html")
     }
 }
 
-fn serve_path(path: &str, token: Option<&str>) -> Response {
+fn serve_path(path: &str) -> Response {
     match Assets::get(path) {
         Some(file) => {
             let mime = mime_for(path);
-            // 仅 HTML 携带占位符；二进制资源原样返回，省一次无谓的 UTF-8 往返。
-            let body: Vec<u8> = if path.ends_with(".html") {
-                String::from_utf8_lossy(&file.data)
-                    .replace(TOKEN_PLACEHOLDER, token.unwrap_or(""))
-                    .into_bytes()
+            let body: Vec<u8> = file.data.into_owned();
+
+            // hashed assets 内容可寻址，可以不可变缓存；HTML 外壳不嵌入任何
+            // 机密，但仍用 no-store 避免旧外壳被共享缓存长期复用。
+            let cache_control = if path.ends_with(".html") {
+                "no-store"
             } else {
-                file.data.into_owned()
+                "public, max-age=31536000, immutable"
             };
-            (StatusCode::OK, [(header::CONTENT_TYPE, mime)], body).into_response()
+
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, cache_control),
+                ],
+                body,
+            )
+                .into_response()
         }
         None => (
             StatusCode::NOT_FOUND,

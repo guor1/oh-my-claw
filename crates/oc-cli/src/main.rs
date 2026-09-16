@@ -217,6 +217,10 @@ fn run_http(
 ) -> anyhow::Result<()> {
     let home = paths::oc_home()?;
 
+    // `--token ""` / `OC_HTTP_TOKEN=""` ≡ 未配置：空 token 会让空的 `Authorization:
+    // Bearer ` 头通过校验，等于把"配了鉴权"当成"无鉴权"。统一在入口归一到 None。
+    let token = token.filter(|t| !t.trim().is_empty());
+
     use tracing_subscriber::prelude::*;
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "oc=info,oc_http=info".into());

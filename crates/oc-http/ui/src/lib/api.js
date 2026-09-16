@@ -1,24 +1,81 @@
 /**
  * API client for the oh-my-claw native REST+SSE API (/api/v1/*).
  *
- * Token is injected by the server into window.__OC_TOKEN__ at page load.
- * An empty string means no-auth (loopback-only mode), in which case the
- * Authorization header is omitted rather than sent as "Bearer ".
+ * Auth is cookie-based: the browser exchanges the operator-supplied token for
+ * an HttpOnly `oc_session` cookie via `/auth/login`, then every request rides
+ * that cookie (sent automatically). In loopback no-auth mode there is no token
+ * and requests simply go out unauthenticated.
  */
 
-const token = () => window.__OC_TOKEN__ || ''
+/** Thrown when the server requires authentication (401). */
+export class AuthError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'AuthError'
+  }
+}
 
-function authHeaders() {
-  const t = token()
-  return t ? { Authorization: `Bearer ${t}` } : {}
+// ── Auth state plumbing ──────────────────────────────────────────────────────
+//
+// Every path that can discover "we are no longer authenticated" funnels through
+// `notifyAuthRequired()`. There are three such paths and they fail differently:
+// a rejected `apiFetch` (AuthError), an `EventSource` that can only report
+// `onerror`, and the startup probe. Without one exit, each of them has to
+// re-derive what to do — which is exactly how the "refresh logs you out" and
+// "silent reconnect loop" bugs happened.
+
+/** Startup/liveness probe outcomes. */
+export const AUTH_OK = 'authed'
+export const AUTH_REQUIRED = 'unauthed'
+export const AUTH_UNREACHABLE = 'unreachable'
+
+/** The single exit for "session is gone; show the login gate". */
+export function notifyAuthRequired() {
+  window.dispatchEvent(new CustomEvent('oc:auth-required'))
+}
+
+/**
+ * Route a rejection to the login gate when it is an auth failure.
+ * @returns {boolean} true if it was handled as an auth failure
+ */
+export function handleAuthFailure(err) {
+  if (err?.name === 'AuthError') {
+    notifyAuthRequired()
+    return true
+  }
+  return false
+}
+
+/**
+ * Probe whether the current session is authenticated.
+ *
+ * Deliberately tri-state and never rejects: only a definitive 200 or 401 is
+ * conclusive. A 5xx (e.g. the daemon connection is down) or a transport error
+ * must NOT be read as "authenticated" — that would show the app shell and fire
+ * a cascade of doomed requests — nor may it throw, which would leave the caller
+ * with no state to render.
+ *
+ * @returns {Promise<'authed'|'unauthed'|'unreachable'>}
+ */
+export async function probeAuth() {
+  let resp
+  try {
+    resp = await fetch('/api/v1/status')
+  } catch (_) {
+    return AUTH_UNREACHABLE
+  }
+  if (resp.status === 200) return AUTH_OK
+  if (resp.status === 401) return AUTH_REQUIRED
+  return AUTH_UNREACHABLE
 }
 
 async function apiFetch(path, opts = {}) {
   const resp = await fetch(path, {
     ...opts,
-    headers: { 'Content-Type': 'application/json', ...authHeaders(), ...opts.headers },
+    headers: { 'Content-Type': 'application/json', ...opts.headers },
   })
   if (!resp.ok) {
+    if (resp.status === 401) throw new AuthError('authentication required')
     let msg = `${resp.status} ${resp.statusText}`
     try {
       const body = await resp.json()
@@ -28,6 +85,24 @@ async function apiFetch(path, opts = {}) {
   }
   return resp
 }
+
+/**
+ * Exchange the operator token for an HttpOnly session cookie.
+ * @param {string} token
+ */
+export async function login(token) {
+  const resp = await fetch('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  })
+  if (!resp.ok) {
+    if (resp.status === 401) throw new AuthError('令牌无效')
+    throw new Error(`登录失败：${resp.status}`)
+  }
+  return resp.json()
+}
+
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
 
@@ -210,21 +285,28 @@ export async function userReply(inputId, text) {
  * @param {function} callbacks.onError     - (message) → void, called on reconnect
  */
 export function openAmbientStream(callbacks) {
-  // EventSource doesn't support custom headers, so the token is injected into
-  // the URL as a query param for this specific request. The native API accepts
-  // it there too (handled in auth middleware via query-param fallback).
-  const t = token()
-  const url = t
-    ? `/api/v1/events?token=${encodeURIComponent(t)}`
-    : '/api/v1/events'
-
-  const es = new EventSource(url)
+  // EventSource cannot set custom headers, but it does send the HttpOnly
+  // cookie automatically (same-origin). No token in the URL anymore.
+  const es = new EventSource('/api/v1/events')
 
   es.addEventListener('status',    e => callbacks.onStatus?.(JSON.parse(e.data)))
   es.addEventListener('usage',     e => callbacks.onUsage?.(JSON.parse(e.data)))
   es.addEventListener('proactive', e => callbacks.onProactive?.(JSON.parse(e.data)))
   es.addEventListener('task',      e => callbacks.onTask?.(JSON.parse(e.data)))
-  es.onerror = () => callbacks.onError?.('ambient stream disconnected; reconnecting…')
+
+  es.onerror = () => {
+    callbacks.onError?.('ambient stream disconnected; reconnecting…')
+    // EventSource exposes neither the status code nor the body, so a 401 from an
+    // expired cookie is indistinguishable from a dropped connection — and its
+    // auto-reconnect would otherwise spin forever re-sending unauthenticated
+    // requests behind a UI that still looks logged in. Probe to tell them apart.
+    probeAuth().then((state) => {
+      if (state === AUTH_REQUIRED) {
+        es.close()
+        notifyAuthRequired()
+      }
+    })
+  }
 
   return () => es.close()
 }

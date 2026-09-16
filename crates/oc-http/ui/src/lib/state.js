@@ -6,7 +6,7 @@
  */
 
 import { reactive, shallowReactive } from 'vue'
-import { fetchSessions, fetchHistory, fetchStatus, openAmbientStream } from './api.js'
+import { fetchSessions, fetchHistory, openAmbientStream, handleAuthFailure } from './api.js'
 import { createActivity } from './activity.js'
 
 // ── Session list ──────────────────────────────────────────────────────────────
@@ -21,7 +21,8 @@ export async function loadSessions({ silent = false } = {}) {
   try {
     sessions.list = await fetchSessions()
   } catch (e) {
-    sessions.error = e.message
+    // An expired cookie must reach the login gate, not sit in an error banner.
+    if (!handleAuthFailure(e)) sessions.error = e.message
   } finally {
     sessions.loading = false
   }
@@ -49,7 +50,16 @@ export function messagesFor(sessionId) {
 }
 
 export async function loadHistory(sessionId) {
-  const entries = await fetchHistory(sessionId)
+  let entries
+  try {
+    entries = await fetchHistory(sessionId)
+  } catch (e) {
+    // A mid-session cookie expiry surfaces here; route it to the login gate so
+    // it can't become an unhandled rejection at a fire-and-forget call site.
+    // Anything else is the caller's to handle (ChatPane renders it on the card).
+    if (handleAuthFailure(e)) return
+    throw e
+  }
   // Build a structured message list: assistant dispatch entries that carry
   // `tool_calls` become per-call ToolCard units; each is matched to its
   // subsequent `tool` result entry (by `tool_call_id`), mirroring openclaw's
@@ -191,8 +201,21 @@ export const notification = reactive({ text: null })
 
 let closeAmbient = null
 
+/**
+ * Tear down the ambient stream, if one is open.
+ *
+ * Explicit teardown matters on auth expiry: without it the old EventSource keeps
+ * auto-reconnecting behind the login gate, re-sending unauthenticated requests.
+ */
+export function stopAmbientStream() {
+  if (closeAmbient) {
+    closeAmbient()
+    closeAmbient = null
+  }
+}
+
 export function startAmbientStream() {
-  if (closeAmbient) closeAmbient()
+  stopAmbientStream()
   closeAmbient = openAmbientStream({
     onStatus(snap) {
       Object.assign(status, snap)

@@ -1,6 +1,7 @@
 //! HTTP server: POST /v1/responses, POST /v1/responses/:id/cancel.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path, State as AxumState},
@@ -38,9 +39,14 @@ pub struct AppState {
     /// response_id → run record, for cancel.
     records: Arc<DashMap<String, ResponseRecord>>,
     default_model: String,
-    /// Bearer token, injected into the Web UI's index.html so the browser
-    /// can authenticate API requests without a separate config step.
+    /// Bearer token. `None` means loopback-only no-auth mode. Never injected
+    /// into the Web UI anymore — the browser obtains access via `/auth/login`,
+    /// which exchanges the token for an HttpOnly session cookie.
     pub(crate) token: Option<String>,
+    /// login session id → creation time, backing the HttpOnly cookie auth.
+    pub(crate) login_sessions: Arc<DashMap<String, Instant>>,
+    /// Lifetime of a login session cookie.
+    pub(crate) login_ttl: Duration,
 }
 
 impl AppState {
@@ -51,6 +57,8 @@ impl AppState {
             records: Arc::new(DashMap::new()),
             default_model,
             token,
+            login_sessions: Arc::new(DashMap::new()),
+            login_ttl: crate::auth::LOGIN_TTL,
         }
     }
 }

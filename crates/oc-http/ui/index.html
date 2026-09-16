@@ -4,8 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>oh-my-claw</title>
-    <!-- Token injected at serve time by assets.rs. Empty string means no auth. -->
-    <script>window.__OC_TOKEN__ = "__OC_TOKEN_VALUE__";</script>
+    <!-- Auth 改为 /auth/login 握手换取 HttpOnly cookie；token 不再注入此页。 -->
   </head>
   <body>
     <div id="app"></div>

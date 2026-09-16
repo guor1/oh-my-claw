@@ -63,18 +63,19 @@ async fn token_gates_api_routes() {
         .expect("应有应答");
     assert_eq!(good.status(), 200, "带正确 Bearer 应放行");
 
-    // ?token= 回退（EventSource 无自定义头）→ 200
+    // ?token= 只在 /api/v1/events（EventSource 无自定义头）放行；普通 API 路由
+    // 不再接受 query token，避免 token 进访问日志 / Referer / 浏览器历史。
     let query = client
         .get(format!("{base}/api/v1/sessions?token=s3cret"))
         .send()
         .await
         .expect("应有应答");
-    assert_eq!(query.status(), 200, "?token= 回退应放行");
+    assert_eq!(query.status(), 401, "?token= 只应在 /api/v1/events 放行");
 }
 
-/// 无 token（loopback 模式）：API 全放行，index.html 注入空 token。
+/// 无 token（loopback 模式）：API 全放行，index.html 不注入任何 token。
 #[tokio::test]
-async fn no_token_allows_all_and_injects_empty() {
+async fn no_token_mode_serves_ui_without_token() {
     let (base, _daemon) = spawn_with("web-none", None).await;
     let client = reqwest::Client::new();
 
@@ -94,17 +95,18 @@ async fn no_token_allows_all_and_injects_empty() {
         .await
         .expect("应能读到 index.html");
     assert!(
-        html.contains(r#"window.__OC_TOKEN__ = "";"#),
-        "无 token 时应注入空串：{html}"
+        !html.contains("__OC_TOKEN__"),
+        "index.html 不应再嵌入 token（含空串）：{html}"
     );
 }
 
-/// 配置了 token 时，index.html 应注入真实 token，浏览器才能带凭据调 API。
+/// 配置了 token 时：index.html 不再注入 token；token 只经 /auth/login 换 cookie。
 #[tokio::test]
-async fn token_is_injected_into_index() {
+async fn token_not_injected_login_grants_cookie() {
     let (base, _daemon) = spawn_with("web-inject", Some("s3cret")).await;
     let client = reqwest::Client::new();
 
+    // 1. index.html 绝不泄露 token。
     let html = client
         .get(&base)
         .send()
@@ -114,11 +116,59 @@ async fn token_is_injected_into_index() {
         .await
         .expect("应能读到 index.html");
     assert!(
-        html.contains(r#"window.__OC_TOKEN__ = "s3cret";"#),
-        "token 应注入到 index.html：{html}"
+        !html.contains("s3cret"),
+        "index.html 不应泄露 token：{html}"
     );
-    // 占位符本身不该残留。
-    assert!(!html.contains("__OC_TOKEN__ = \"__OC_TOKEN__\""), "占位符应已被替换");
+    assert!(!html.contains("__OC_TOKEN__"), "占位符/注入点应已移除：{html}");
+
+    // 2. 错误 token → 401。
+    let bad = client
+        .post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({ "token": "wrong" }))
+        .send()
+        .await
+        .expect("应有应答");
+    assert_eq!(bad.status(), 401, "错误 token 应 401");
+
+    // 3. 正确 token → 200 + HttpOnly cookie。
+    let login = client
+        .post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({ "token": "s3cret" }))
+        .send()
+        .await
+        .expect("应有应答");
+    assert_eq!(login.status(), 200, "正确 token 应 200");
+    let set_cookie = login
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(set_cookie.starts_with("oc_session="), "应下发 oc_session cookie");
+    assert!(set_cookie.contains("HttpOnly"), "cookie 应为 HttpOnly：{set_cookie}");
+
+    // 4. 带该 cookie 调 API → 放行。
+    let ok = client
+        .get(format!("{base}/api/v1/sessions"))
+        .header("Cookie", set_cookie.split(';').next().unwrap_or(""))
+        .send()
+        .await
+        .expect("应有应答");
+    assert_eq!(ok.status(), 200, "带登录 cookie 应放行");
+}
+
+/// 未登录时（无 cookie、无 Bearer）受保护 API 应 401。
+#[tokio::test]
+async fn protected_api_requires_auth() {
+    let (base, _daemon) = spawn_with("web-auth-required", Some("s3cret")).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/v1/sessions"))
+        .send()
+        .await
+        .expect("应有应答");
+    assert_eq!(resp.status(), 401, "无凭据应 401");
 }
 
 /// 静态资源 fallback 不应把 API 路径 404 变成 HTML。

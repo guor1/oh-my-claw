@@ -26,7 +26,7 @@ pub mod assets;
 
 pub use error::{HttpError, HttpResult};
 
-use axum::{middleware, routing::get};
+use axum::{middleware, routing::get, routing::post};
 use tower_http::cors::CorsLayer;
 
 /// Configuration for the full HTTP app.
@@ -45,14 +45,17 @@ pub fn create_app(pool: conn_pool::ConnPool, default_model: String, cfg: AppConf
     let mut router = axum::Router::new()
         .merge(server::routes())
         .merge(native::routes())
+        .route("/auth/login", post(auth::login))
         .route("/health", get(health));
 
     if cfg.web_ui {
         router = router.merge(assets::routes());
     }
 
+    // The auth middleware reads `token` + the login-session table off AppState,
+    // so it's wired with the same state the routes use.
     router
-        .layer(middleware::from_fn_with_state(cfg.token, auth::require_token))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::require_token))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
