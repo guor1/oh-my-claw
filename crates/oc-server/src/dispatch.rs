@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use oc_proto::{
-    ChatAbortParams, ChatSendParams, ClientKind, ConnectParams, Features, Frame, Method, MethodOk,
-    ProtoError, Req, ResResult, SessionId, Snapshot, PROTO_VERSION,
+    ChatAbortParams, ChatResumeParams, ChatSendParams, ClientKind, ConnectParams, Features, Frame,
+    Method, MethodOk, ProtoError, Req, ResResult, SessionId, Snapshot, PROTO_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -34,6 +34,7 @@ pub async fn handle_req(
     let result = match &req.method {
         Method::Connect(p) => handle_connect(p, state),
         Method::ChatSend(p) => handle_chat_send(p, state, out_tx, client_kind).await,
+        Method::ChatResume(p) => handle_chat_resume(p, state, out_tx).await,
         Method::ChatAbort(p) => handle_chat_abort(p, state).await,
         Method::ApprovalReply(p) => {
             state.resolve_approval(&p.approval_id, p.allow);
@@ -144,6 +145,24 @@ fn handle_connect(p: &ConnectParams, state: &Arc<ServerState>) -> Result<MethodO
         },
         snapshot: snapshot(state, &SessionId::main()),
     })
+}
+
+/// 接续一个在途 Detached run：从 session actor 租 RunLog，回放+续流到 out_tx。
+async fn handle_chat_resume(
+    p: &ChatResumeParams,
+    state: &Arc<ServerState>,
+    out_tx: &mpsc::Sender<Frame>,
+) -> Result<MethodOk, ProtoError> {
+    let handle = state.registry().get_or_spawn(&p.session);
+    let ok = handle.resume(p.run_id.clone(), out_tx.clone()).await;
+    if ok {
+        Ok(MethodOk::ChatResume { session: p.session.clone() })
+    } else {
+        Err(ProtoError {
+            kind: oc_proto::ErrorKind::Internal,
+            message: "run 不存在或已结束".to_string(),
+        })
+    }
 }
 
 /// M3：提交到主会话车道，返回分配的 run_id；实际处理经 per-run sink 定向推送。

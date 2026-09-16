@@ -46,6 +46,8 @@ pub enum Method {
     /// 斜杠指令：daemon 是唯一解析器，客户端只负责「是否 `/` 开头」就发过来。
     /// 新增指令改 daemon 一处，TUI / Web UI 自动获得。
     Command(CommandParams),
+    /// 接续一个在途 Detached run 的剩余内联事件流（回放缓冲 + 续流）。
+    ChatResume(ChatResumeParams),
 }
 
 /// 方法成功返回，与 [`Method`] 一一对应。
@@ -73,6 +75,8 @@ pub enum MethodOk {
     /// 斜杠指令的执行结果：`text` 给用户看，`switch_session`/`clear_view` 让客户端
     /// 应用视图副作用。
     Command(CommandResult),
+    /// resume 已挂上，后续事件经本连接出站队列流式回发。
+    ChatResume { session: SessionId },
 }
 
 // ── params ──────────────────────────────────────────────────────
@@ -117,6 +121,13 @@ pub struct ChatSendParams {
     #[serde(default)]
     pub session: Option<SessionId>,
     pub text: String,
+}
+
+/// ChatResume 参数：显式带 session（避免遍历 registry，也匹配前端手头的 active_session_id）。
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChatResumeParams {
+    pub session: SessionId,
+    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -483,5 +494,16 @@ mod tests {
         let s = serde_json::to_string(&p).expect("ser");
         let back: ConnectParams = serde_json::from_str(&s).expect("deser");
         assert_eq!(back.client_kind, ClientKind::Detached);
+    }
+
+    #[test]
+    fn chat_resume_roundtrips() {
+        let m = Method::ChatResume(ChatResumeParams {
+            session: SessionId::main(),
+            run_id: RunId::new("r1"),
+        });
+        let s = serde_json::to_string(&m).expect("ser");
+        let back: Method = serde_json::from_str(&s).expect("deser");
+        assert!(matches!(back, Method::ChatResume(_)));
     }
 }

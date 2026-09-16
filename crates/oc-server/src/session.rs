@@ -11,7 +11,7 @@ use std::time::Duration;
 use oc_core::agent::RunOutcome;
 use oc_core::queue::{diagnose, QueuedTurn, RunHealth, RunQueue, SubmitResult};
 use oc_llm::Provider;
-use oc_proto::{Event, RunId, SessionId};
+use oc_proto::{Event, Frame, RunId, SessionId};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -111,6 +111,12 @@ pub enum SessionCmd {
     Compact,
     /// 活跃 run 结束通知（内部）。
     Finished { run_id: RunId, outcome: RunOutcome },
+    /// 接续一个在途 Detached run：取 run_logs 里的 RunLog，spawn 回放+续流任务。
+    Resume {
+        run_id: RunId,
+        out_tx: mpsc::Sender<Frame>,
+        reply: oneshot::Sender<bool>,
+    },
     /// 卡死诊断扫描（由心跳 tick 触发）：检查活跃 run 是否卡死。
     HealthScan,
     /// 空闲淘汰探针（P2-3，由心跳 tick 经 registry 触发）。
@@ -163,6 +169,16 @@ impl SessionHandle {
     /// 手动触发压缩（/compact）。
     pub async fn compact(&self) {
         let _ = self.tx.send(SessionCmd::Compact).await;
+    }
+
+    /// 接续一个在途 run。`true` = 已挂上（回放+续流任务已 spawn），
+    /// `false` = run 不存在或已结束（无 RunLog 可订阅）。
+    pub async fn resume(&self, run_id: RunId, out_tx: mpsc::Sender<Frame>) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(SessionCmd::Resume { run_id, out_tx, reply }).await.is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// 触发一次卡死诊断扫描（心跳 tick 调用）。
@@ -238,6 +254,10 @@ async fn actor_loop(
     // 排队轮的 sink 也在此暂存，直到车道空出、该轮起步。
     let mut sinks: std::collections::HashMap<String, crate::sink::RunSink> =
         std::collections::HashMap::new();
+    // run_id → Detached run 的事件日志。与 sinks 同生命周期：Submit 存入、
+    // Rejected/Finished 移除。resume 从这里取 RunLog 回放+续流。
+    let mut run_logs: std::collections::HashMap<String, std::sync::Arc<crate::run_log::RunLog>> =
+        std::collections::HashMap::new();
     let sid = session_id.to_string();
     // 上次「真实活动」时刻，供空闲淘汰判定（P2-3）。
     //
@@ -269,7 +289,11 @@ async fn actor_loop(
                 let run_id = RunId::new(uuid_v7());
                 info!(session = %sid, run_id = %run_id, chars = text.chars().count(), "submit 受理");
                 // 暂存本轮 sink（起步时取用）。
-                sinks.insert(run_id.to_string(), sink);
+                sinks.insert(run_id.to_string(), sink.clone());
+                // Detached run：把 RunLog 一并存入 run_logs，供后续 resume 回放+续流。
+                if let crate::sink::RunSink::Detached { log, .. } = &sink {
+                    run_logs.insert(run_id.to_string(), std::sync::Arc::clone(log));
+                }
 
                 // 注意：**此处不落库用户消息**。落库推迟到该轮真正起步时（见 begin_run）。
                 // 原因：同一 session 并发提交时，排队轮若在 submit 时就落库，会被前一个
@@ -307,6 +331,7 @@ async fn actor_loop(
                         diag.set_error("队列已满，拒绝新轮".to_string());
                         // 该轮不会跑，清理其暂存 sink，避免泄漏。
                         sinks.remove(run_id.as_str());
+                        run_logs.remove(run_id.as_str());
                         // 不回执：drop(reply) 让调用方的 `rx.await` 失败 → None。
                         drop(reply);
                     }
@@ -356,6 +381,7 @@ async fn actor_loop(
                     active = None;
                     // 完成轮的 sink 已随 run 结束失效，清理。
                     sinks.remove(run_id.as_str());
+                    run_logs.remove(run_id.as_str());
                     // 取下一个排队轮。此刻前一轮已彻底完成（含其所有消息落库），
                     // 现在才落库并加载历史，保证顺序正确。
                     if let Some(next) = queue.complete_active() {
@@ -382,6 +408,16 @@ async fn actor_loop(
                         });
                     }
                 }
+            }
+            SessionCmd::Resume { run_id, out_tx, reply } => {
+                let hit = if let Some(log) = run_logs.get(run_id.as_str()) {
+                    let sub = log.subscribe(false); // 回放过滤 reasoning（只续不补）
+                    tokio::spawn(forward_run_log(sub, out_tx));
+                    true
+                } else {
+                    false
+                };
+                let _ = reply.send(hit);
             }
             SessionCmd::HealthScan => {
                 if let Some(a) = &active {
@@ -436,6 +472,31 @@ async fn actor_loop(
                 // 得到 `None` → dispatch 重新 `get_or_spawn`（拿到新 actor）后重试。
                 break;
             }
+        }
+    }
+}
+
+/// 回放 + 续流转发：逐条把 RunLog 订阅者的事件转发到 out_tx，到 Lifecycle 终态停。
+///
+/// 回放阶段已由 `subscribe(false)` 过滤 reasoning；续流阶段的 reasoning 照常转发
+/// （「后续 thinking 照常续」）。出站 send 失败（客户端又断）即退出。
+async fn forward_run_log(
+    mut sub: tokio::sync::mpsc::UnboundedReceiver<oc_proto::Event>,
+    out_tx: tokio::sync::mpsc::Sender<oc_proto::Frame>,
+) {
+    while let Some(ev) = sub.recv().await {
+        let terminal = matches!(
+            &ev,
+            oc_proto::Event::Lifecycle {
+                phase: oc_proto::LifecyclePhase::End | oc_proto::LifecyclePhase::Error { .. },
+                ..
+            }
+        );
+        if out_tx.send(oc_proto::Frame::Event(ev)).await.is_err() {
+            break;
+        }
+        if terminal {
+            break;
         }
     }
 }
