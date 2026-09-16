@@ -13,7 +13,7 @@
 //! `Proactive`（cron/心跳带外通知，与任何 run 无关）留在广播——低频广播几乎不 Lagged，
 //! 且省一条通知路径。二分见 [06-zeroclaw流式传输调研.md] 的「两类通道职责二分」。
 //!
-//! **枚举而非 trait object**：只有两个变体、无动态扩展需求，`enum` 比 `Box<dyn Fn>`
+//! **枚举而非 trait object**：变体少、无动态扩展需求，`enum` 比 `Box<dyn Fn>`
 //! 性能更好（无虚调用/堆分配）、更符合 Rust 穷尽匹配规范。
 
 use oc_proto::{Event, Frame};
@@ -24,18 +24,21 @@ use tokio::sync::{broadcast, mpsc};
 /// - [`RunSink::Conn`]：生产路径。事件包成 `Frame` 送发起连接的出站队列，**有界背压**。
 /// - [`RunSink::Broadcast`]：测试/带外路径。沿用广播语义（多订阅者、慢则 Lagged）。
 ///   run driver 单测直接 `subscribe()` 断言事件序列时用它。
+/// - [`RunSink::Detached`]：无状态网关（Web/HTTP）路径。连接活着时照常转发（流式完整），
+///   断连后吞掉 send 失败仍返回成功，run 继续跑完落库。
 #[derive(Clone)]
 pub enum RunSink {
     /// 定向到单条连接的出站队列（有界背压，不丢）。
     Conn(mpsc::Sender<Frame>),
     /// 广播（测试断言 / 沿用旧语义）。
     Broadcast(broadcast::Sender<Event>),
-    /// 无连接归属（Detached 客户端）：事件静默丢弃、`closed()` 永不触发。
+    /// 无状态网关（Detached 客户端）：持有连接发送端——连接活着时事件照常转发，
+    /// 断连后 send 失败被吞掉、仍返回成功，故「send 失败 → 断连」探测失效；
+    /// `closed()` 永久挂起，静默等待期（等模型/审批/ask_user）也不因断连收敛。
     ///
-    /// 供 Web/HTTP 网关使用——run 归属会话而非连接，客户端刷新/断连不中止 run。
-    /// `send` 恒真所以「send 失败 → 断连」探测失效，`closed` 永久挂起所以
-    /// 静默等待期（等模型/审批/ask_user）也不会因断连收敛。
-    Detached,
+    /// 供 Web/HTTP 网关使用——run 归属会话而非连接，客户端刷新/断连不中止 run，
+    /// 但连接未断时仍能拿到完整内联事件流（流式回复照常送达）。
+    Detached(mpsc::Sender<Frame>),
 }
 
 impl RunSink {
@@ -46,7 +49,12 @@ impl RunSink {
     /// `select!` 叠加 cancel，使背压期间仍能响应 abort/看门狗（见 run.rs）。
     pub async fn send(&self, ev: Event) -> bool {
         match self {
-            RunSink::Detached => true,
+            // Detached：连接活着时正常转发；断连后 send 失败被吞掉、仍返回 true，
+            // 不触发 run driver 的「send 失败 → cancel」探测（run 继续跑完落库）。
+            RunSink::Detached(tx) => {
+                let _ = tx.send(Frame::Event(ev)).await;
+                true
+            }
             RunSink::Conn(tx) => tx.send(Frame::Event(ev)).await.is_ok(),
             // 广播 send 仅在无接收端时 Err；测试里接收端一直在，视为始终可达。
             RunSink::Broadcast(tx) => {
@@ -66,7 +74,7 @@ impl RunSink {
         match self {
             RunSink::Conn(tx) => tx.closed().await,
             RunSink::Broadcast(_) => std::future::pending().await,
-            RunSink::Detached => std::future::pending().await,
+            RunSink::Detached(_) => std::future::pending().await,
         }
     }
 }
@@ -78,7 +86,10 @@ mod tests {
 
     #[tokio::test]
     async fn detached_send_always_succeeds() {
-        let sink = RunSink::Detached;
+        // rx 保留（未 drop），tx 未关闭：send 应成功。即便下游断开，Detached 仍吞掉
+        // 失败返回 true，故这里也顺带验证「未关闭时正常送达」路径恒成功。
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let sink = RunSink::Detached(tx);
         let ok = sink
             .send(Event::Lifecycle {
                 session: SessionId::main(),

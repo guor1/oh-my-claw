@@ -156,10 +156,11 @@ async fn handle_chat_send(
     // 缺省路由到 main；未知 id 由 registry 懒创建（隐式建会话）。
     let session = p.session.clone().unwrap_or_else(SessionId::main);
     let handle = state.registry().get_or_spawn(&session);
-    // Detached 网关（Web/HTTP）：run 归属会话而非连接，断连不中止；
+    // Detached 网关（Web/HTTP）：run 归属会话而非连接，断连不中止；连接活着时
+    // 事件照常转发（流式完整），断连后 send 失败被吞掉、run 继续跑完落库。
     // Interactive 客户端：本轮内联事件定向回发到这条连接（背压不丢，P0-1）。
     let sink = match client_kind {
-        ClientKind::Detached => RunSink::Detached,
+        ClientKind::Detached => RunSink::Detached(out_tx.clone()),
         ClientKind::Interactive => RunSink::Conn(out_tx.clone()),
     };
     let mut result = handle.submit(p.text.clone(), sink.clone()).await;
