@@ -14,6 +14,7 @@ pub mod ledger;
 pub mod proactive;
 pub mod registry;
 pub mod run;
+pub mod run_log;
 pub mod scheduler;
 pub mod session;
 pub mod sink;
