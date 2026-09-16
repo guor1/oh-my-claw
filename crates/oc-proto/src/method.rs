@@ -77,11 +77,39 @@ pub enum MethodOk {
 
 // ── params ──────────────────────────────────────────────────────
 
+/// 连接的客户端类型：决定 run 是否随连接断开而中止。
+///
+/// - `Interactive`：TUI / CLI 等驻留客户端。断连即中止 run、立即释放车道
+///   （原有语义，对应 `RunSink::Conn` 的 `closed()` 探测）。
+/// - `Detached`：Web / HTTP 无状态网关。run 归属会话而非连接，断连不中止——
+///   客户端刷新页面后 run 继续跑完并落库（对齐 OpenClaw 的 delivery-key 解耦）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    Interactive,
+    Detached,
+}
+
+impl Default for ClientKind {
+    fn default() -> Self {
+        ClientKind::Interactive
+    }
+}
+
+impl ClientKind {
+    fn is_interactive(&self) -> bool {
+        matches!(self, ClientKind::Interactive)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConnectParams {
     pub proto_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// 客户端类型（见 [`ClientKind`]）。旧客户端缺省为 Interactive。
+    #[serde(default, skip_serializing_if = "ClientKind::is_interactive")]
+    pub client_kind: ClientKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -430,4 +458,30 @@ pub enum RunPhase {
     ToolExec,
     /// 正在执行 compact 摘要（占用车道）。
     Compacting,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧客户端（无 client_kind 字段）的握手帧反序列化后应为 Interactive——
+    /// 这是向后兼容红线：老 CLI/TUI 不得因此被当成 Detached。
+    #[test]
+    fn connect_params_defaults_client_kind_to_interactive() {
+        let p: ConnectParams =
+            serde_json::from_str(r#"{"proto_version":1,"token":null}"#).expect("deser");
+        assert_eq!(p.client_kind, ClientKind::Interactive);
+    }
+
+    #[test]
+    fn client_kind_roundtrips() {
+        let p = ConnectParams {
+            proto_version: 1,
+            token: None,
+            client_kind: ClientKind::Detached,
+        };
+        let s = serde_json::to_string(&p).expect("ser");
+        let back: ConnectParams = serde_json::from_str(&s).expect("deser");
+        assert_eq!(back.client_kind, ClientKind::Detached);
+    }
 }
