@@ -887,7 +887,7 @@ async fn persist(
         return;
     }
     let est = (content.chars().count() as i64 / 4).max(1);
-    if let Err(e) = ctx
+    match ctx
         .store
         .writer()
         .append_entry(oc_store::NewEntry {
@@ -900,7 +900,10 @@ async fn persist(
         })
         .await
     {
-        warn!(run_id = %ctx.run_id, error = %e, "落库消息失败");
+        // 打落库标记：此刻之前发出的事件，内容已进这条 entry。刷新接续据此
+        // 跳过客户端已从历史拿到的那几组事件（否则工具卡/正文渲染两遍）。
+        Ok(seq) => ctx.sink.mark_persisted(seq),
+        Err(e) => warn!(run_id = %ctx.run_id, error = %e, "落库消息失败"),
     }
 }
 

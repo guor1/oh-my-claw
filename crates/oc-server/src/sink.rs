@@ -78,6 +78,16 @@ impl RunSink {
             RunSink::Detached { .. } => std::future::pending().await,
         }
     }
+
+    /// 打一个落库标记：此前发出的事件，其内容已落进 seq 为 `seq` 的 entry。
+    ///
+    /// 只有 `Detached` 需要——刷新接续靠它把回放裁到客户端历史水位之后。
+    /// `Conn`（TUI/CLI）不接续，`Broadcast`（测试）无历史概念，均为 no-op。
+    pub fn mark_persisted(&self, seq: i64) {
+        if let RunSink::Detached { log, .. } = self {
+            log.mark_persisted(seq);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +128,38 @@ mod tests {
         let mut sub = log.subscribe(false);
         let ev = sub.try_recv().expect("sink.send 应写入 RunLog");
         assert!(matches!(&ev, Event::Assistant { delta, .. } if delta == "你"));
+    }
+
+    /// sink 上打的落库标记必须落到它持有的 RunLog 上，否则 subscribe_from
+    /// 找不到标记点、永远全量回放（等于本特性没生效）。
+    #[tokio::test]
+    async fn detached_mark_persisted_reaches_runlog() {
+        let log = std::sync::Arc::new(RunLog::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(8);
+        let sink = RunSink::Detached { tx, log: log.clone() };
+
+        let ev = |d: &str| Event::Assistant {
+            session: SessionId::main(),
+            run_id: oc_proto::RunId::new("r"),
+            delta: d.into(),
+        };
+        sink.send(ev("旧")).await;
+        sink.mark_persisted(7);
+        sink.send(ev("新")).await;
+
+        let mut sub = log.subscribe_from(7, false);
+        let first = sub.try_recv().expect("标记点之后应有一条事件");
+        assert!(matches!(&first, Event::Assistant { delta, .. } if delta == "新"));
+        assert!(sub.try_recv().is_err(), "标记点之前的「旧」不该被回放");
+    }
+
+    /// 非 Detached sink 上打标记是 no-op，且不得 panic——TUI/CLI 路径共用
+    /// 同一个 persist()，不能因为没有 RunLog 就炸。
+    #[tokio::test]
+    async fn non_detached_mark_persisted_is_noop() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        RunSink::Conn(tx).mark_persisted(1);
+        let (btx, _brx) = tokio::sync::broadcast::channel::<Event>(4);
+        RunSink::Broadcast(btx).mark_persisted(1);
     }
 }
