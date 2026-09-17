@@ -49,6 +49,20 @@ export function messagesFor(sessionId) {
   return messageMap[sessionId]
 }
 
+// 每会话的历史水位：`loadHistory` 拿到的最大 entry seq。
+// resume 时上报给服务端，让它跳过「已落库、客户端已渲染」的那几组事件——
+// 不报的话工具卡会建两张、工具输出拼两遍、assistant 正文渲染两遍。
+const historySeq = {}
+
+/** 历史条目里的最大 seq；空历史 / 缺字段返回 0（= 全量回放）。 */
+export function historyMaxSeq(entries) {
+  let max = 0
+  for (const e of entries ?? []) {
+    if (typeof e?.seq === 'number' && e.seq > max) max = e.seq
+  }
+  return max
+}
+
 export async function loadHistory(sessionId) {
   let entries
   try {
@@ -100,6 +114,7 @@ export async function loadHistory(sessionId) {
     }
     msgs.push({ id: `hist-${e.seq}`, role: e.role, content: e.content, ts: e.created_at })
   }
+  historySeq[sessionId] = historyMaxSeq(entries)
   messageMap[sessionId] = msgs
 }
 
@@ -319,6 +334,11 @@ export function maybeResume(sessionId) {
   if (!rid) return
   if (activeChats.has(sessionId)) return   // 已有流在跑，不重复挂
 
+  // 历史还没加载完就 resume，等于声明「我什么都没有」→ 服务端全量回放，
+  // 随后 loadHistory 再渲染一遍同样内容 → 正是本次要修的重复。宁可不接。
+  const sinceSeq = historySeq[sessionId]
+  if (sinceSeq === undefined) return
+
   const target = sessionId
   const act = activityFor(target)
   act.arm(Date.now())
@@ -326,6 +346,7 @@ export function maybeResume(sessionId) {
   const ctrl = resumeChat({
     session: target,
     runId: rid,
+    sinceSeq,
     onReasoning(delta) { act.reasoning(delta, Date.now()) },
     onDelta(delta) {
       act.visible()

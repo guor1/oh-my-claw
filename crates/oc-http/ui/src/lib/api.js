@@ -258,12 +258,12 @@ export function sendChat(opts) {
  * 接续一个在途 run 的剩余流（回放 + 续流），回调签名与 sendChat 一致
  * （无 onAccepted——run_id 由调用方已知）。返回 controller，abort() 只断流、不发 abort。
  */
-export function resumeChat({ session, runId, onDelta, onReasoning, onTool, onEnd, onError }) {
+export function resumeChat({ session, runId, sinceSeq = 0, onDelta, onReasoning, onTool, onEnd, onError }) {
   const ctrl = new AbortController()
   ;(async () => {
     try {
       const resp = await apiFetch(
-        `/api/v1/chat/resume?run_id=${encodeURIComponent(runId)}&session=${encodeURIComponent(session)}`,
+        `/api/v1/chat/resume?run_id=${encodeURIComponent(runId)}&session=${encodeURIComponent(session)}&since_seq=${encodeURIComponent(sinceSeq)}`,
         { signal: ctrl.signal, headers: { Accept: 'text/event-stream' } },
       )
       const reader = resp.body.getReader()
