@@ -615,7 +615,13 @@ async fn run_model_turn(
                 if !tc.call_id.is_empty() {
                     tc_id = tc.call_id;
                 }
-                if let Some(name) = tc.name {
+                // 与上面的 call_id 同样判空：`id`/`name` 只在工具调用的首个分片出现，
+                // 后续分片只该续 `arguments`——但 provider 会把 `function.name` 一并
+                // 带上且置空（`as_str()` → `Some("")`）。不判空就赋值的话，**最后一个
+                // 分片会把首片给出的好名字清成空串**，于是落库成哨兵 unknown_tool、
+                // 白跑一轮让模型重试（真机 deepseek-v4-flash-0731 上高频复现）。
+                // 名字整条到达、不分片，所以「非空才覆盖」不会截断合法名字。
+                if let Some(name) = tc.name.filter(|n| !n.is_empty()) {
                     tc_name = name;
                 }
                 tc_args.push_str(&tc.args_chunk);
