@@ -154,7 +154,7 @@ async fn handle_chat_resume(
     out_tx: &mpsc::Sender<Frame>,
 ) -> Result<MethodOk, ProtoError> {
     let handle = state.registry().get_or_spawn(&p.session);
-    let ok = handle.resume(p.run_id.clone(), out_tx.clone()).await;
+    let ok = handle.resume(p.run_id.clone(), p.since_seq, out_tx.clone()).await;
     if ok {
         Ok(MethodOk::ChatResume { session: p.session.clone() })
     } else {

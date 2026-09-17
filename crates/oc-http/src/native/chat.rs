@@ -244,7 +244,7 @@ pub async fn resume(
     handshake(&mut conn).await?;
     send_req(
         &mut conn,
-        Method::ChatResume(ChatResumeParams { session: session.clone(), run_id: run_id.clone() }),
+        Method::ChatResume(ChatResumeParams { session: session.clone(), run_id: run_id.clone(), since_seq: 0 }),
         None,
     )
     .await?;

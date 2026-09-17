@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use oc_llm::provider::Provider;
 use oc_proto::{
-    ChatSendParams, ClientKind, ConnectParams, Event, Frame, LifecyclePhase, Method, Req, ReqId,
-    ResResult, SessionId, PROTO_VERSION,
+    ChatResumeParams, ChatSendParams, ClientKind, ConnectParams, Event, Frame, LifecyclePhase,
+    Method, Req, ReqId, ResResult, RunId, SessionId, PROTO_VERSION,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -455,6 +455,21 @@ impl TestClient {
         self.request(Method::ChatSend(ChatSendParams {
             session,
             text: text.into(),
+        }))
+        .await
+    }
+
+    /// 发一条 chat.resume（接续在途 Detached run）。
+    pub async fn resume(
+        &mut self,
+        session: SessionId,
+        run_id: RunId,
+        since_seq: i64,
+    ) -> ReqId {
+        self.request(Method::ChatResume(ChatResumeParams {
+            session,
+            run_id,
+            since_seq,
         }))
         .await
     }

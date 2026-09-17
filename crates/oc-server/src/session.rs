@@ -114,6 +114,8 @@ pub enum SessionCmd {
     /// 接续一个在途 Detached run：取 run_logs 里的 RunLog，spawn 回放+续流任务。
     Resume {
         run_id: RunId,
+        /// 客户端历史水位，见 `ChatResumeParams::since_seq`。
+        since_seq: i64,
         out_tx: mpsc::Sender<Frame>,
         reply: oneshot::Sender<bool>,
     },
@@ -173,9 +175,14 @@ impl SessionHandle {
 
     /// 接续一个在途 run。`true` = 已挂上（回放+续流任务已 spawn），
     /// `false` = run 不存在或已结束（无 RunLog 可订阅）。
-    pub async fn resume(&self, run_id: RunId, out_tx: mpsc::Sender<Frame>) -> bool {
+    pub async fn resume(&self, run_id: RunId, since_seq: i64, out_tx: mpsc::Sender<Frame>) -> bool {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(SessionCmd::Resume { run_id, out_tx, reply }).await.is_err() {
+        if self
+            .tx
+            .send(SessionCmd::Resume { run_id, since_seq, out_tx, reply })
+            .await
+            .is_err()
+        {
             return false;
         }
         rx.await.unwrap_or(false)
@@ -409,9 +416,10 @@ async fn actor_loop(
                     }
                 }
             }
-            SessionCmd::Resume { run_id, out_tx, reply } => {
+            SessionCmd::Resume { run_id, since_seq, out_tx, reply } => {
                 let hit = if let Some(log) = run_logs.get(run_id.as_str()) {
-                    let sub = log.subscribe(false); // 回放过滤 reasoning（只续不补）
+                    // 回放过滤 reasoning（只续不补）；起点按客户端历史水位裁剪。
+                    let sub = log.subscribe_from(since_seq, false);
                     tokio::spawn(forward_run_log(sub, out_tx));
                     true
                 } else {

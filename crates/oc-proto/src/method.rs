@@ -128,6 +128,11 @@ pub struct ChatSendParams {
 pub struct ChatResumeParams {
     pub session: SessionId,
     pub run_id: RunId,
+    /// 客户端已从落库历史拿到的最大 entry seq。服务端据此裁剪回放起点：
+    /// 落进 seq ≤ 本值的事件不重放（否则前端工具卡建两张、正文渲染两遍）。
+    /// `0` = 什么都没有，全量回放。
+    #[serde(default)]
+    pub since_seq: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -501,9 +506,20 @@ mod tests {
         let m = Method::ChatResume(ChatResumeParams {
             session: SessionId::main(),
             run_id: RunId::new("r1"),
+            since_seq: 3,
         });
         let s = serde_json::to_string(&m).expect("ser");
         let back: Method = serde_json::from_str(&s).expect("deser");
         assert!(matches!(back, Method::ChatResume(_)));
+    }
+
+    /// 旧客户端不带 since_seq 的帧反序列化后应为 0（全量回放）——向后兼容红线。
+    #[test]
+    fn chat_resume_defaults_since_seq_to_zero() {
+        let p: ChatResumeParams = serde_json::from_str(
+            r#"{"session":"main","run_id":"r1"}"#,
+        )
+        .expect("deser");
+        assert_eq!(p.since_seq, 0);
     }
 }
