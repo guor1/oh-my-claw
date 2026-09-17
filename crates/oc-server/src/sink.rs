@@ -79,6 +79,29 @@ impl RunSink {
         }
     }
 
+    /// 等待「交互式等待（ask_user）的下游断开」：与 [`closed`] 的区别在于
+    /// **Detached 也会在此完成**。
+    ///
+    /// ask_user 期间不再 send，断连只能靠等待感知。Detached 的 [`closed`] 被刻意
+    /// 设为永挂起——那是给**流式阶段**用的（断连继续跑）。但 ask_user 断连意味着
+    /// 没人能再答复，等待必须收敛，否则干等到 600s 超时。故交互式等待用本方法。
+    pub async fn closed_interactive(&self) {
+        match self {
+            RunSink::Conn(tx) => tx.closed().await,
+            RunSink::Detached { tx, .. } => tx.closed().await,
+            RunSink::Broadcast(_) => std::future::pending().await,
+        }
+    }
+
+    /// 是否 Detached（Web/HTTP 网关）。
+    ///
+    /// 交互式等待断连时据此决定是否 cancel 整个 run：Conn（TUI）走人 → cancel 收敛
+    /// （避免在死连接上白打一轮模型）；Detached（Web 刷新）→ 不 cancel，让工具
+    /// 返回「未作答」、run 继续跑完落库（断连继续跑的语义）。
+    pub fn is_detached(&self) -> bool {
+        matches!(self, RunSink::Detached { .. })
+    }
+
     /// 打一个落库标记：此前发出的事件，其内容已落进 seq 为 `seq` 的 entry。
     ///
     /// 只有 `Detached` 需要——刷新接续靠它把回放裁到客户端历史水位之后。

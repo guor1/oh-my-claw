@@ -124,7 +124,14 @@ async fn request_input(
     // 断连时主动 cancel 整个 run，令其立即收敛。
     tokio::select! {
         _ = cancel.cancelled() => None,
-        _ = sink.closed() => { cancel.cancel(); None }
+        _ = sink.closed_interactive() => {
+            // ask_user 的下游断了：Conn（TUI 走人）→ cancel 收敛；Detached（Web 刷新）
+            // → 不 cancel，让工具返回「未作答」、run 继续跑完落库（断连继续跑语义）。
+            if !sink.is_detached() {
+                cancel.cancel();
+            }
+            None
+        }
         r = rx => r.unwrap_or(None),
     }
 }
