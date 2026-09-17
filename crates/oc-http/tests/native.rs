@@ -14,10 +14,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use oc_llm::mock::{MockProvider, ScriptStep};
+use oc_core::tool::ApprovalMode;
+use oc_llm::mock::{MockProvider, ScriptStep, SequencedMock};
+use oc_llm::types::ToolCallDelta;
 use oc_llm::{Delta, FinishReason};
 use oc_server::testing::TestDaemon;
+use oc_server::tools_bridge::ToolExecutor;
 use oc_server::TransportKind;
+use oc_tools::exec::ExecTool;
+use oc_tools::shell::Shell;
+use oc_tools::ToolRegistry;
 
 async fn spawn_gateway(transport: TransportKind, max_conns: usize) -> String {
     let pool = oc_http::conn_pool::ConnPool::new(transport, max_conns, max_conns);
@@ -76,6 +82,19 @@ fn streaming_reply(n: usize, gap: Duration) -> Vec<ScriptStep> {
         delta: Delta::Done(FinishReason::Stop),
     });
     steps
+}
+
+/// 免审批 exec：`ApprovalMode::Allow` 让工具轮不卡在审批门上。
+/// 与 oc-server 的 `resume_run.rs` / `concurrent_submit.rs` 同款。
+fn exec_tools() -> ToolExecutor {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(ExecTool::new(
+        ApprovalMode::Allow,
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        Shell::resolve().unwrap(),
+    )));
+    ToolExecutor::new(Arc::new(reg))
 }
 
 /// chat/send 应流式返回，首事件给 run_id，末事件是 lifecycle end。
@@ -619,4 +638,111 @@ async fn resume_endpoint_streams_remainder() {
     for d in &prefix {
         assert!(sse.contains(d), "回放前缀「{d}」未出现在 resume 流：{sse}");
     }
+}
+
+/// `since_seq` 一路透传到 daemon：声明已有到 seq=3 后，已落库的工具轮不再回放。
+///
+/// 这条守的是 HTTP 层——query 参数漏填或拼错时，服务端只会收到默认值 0、
+/// 悄悄退回全量回放，前端刷新后重复渲染的 bug 会无声复发。
+#[tokio::test]
+async fn resume_endpoint_forwards_since_seq() {
+    use oc_server::testing::SessionConfigExt;
+
+    // 第 1 轮：一句正文 + 工具调用；第 2 轮：6 段文本。
+    let round1 = vec![
+        ScriptStep { delay: Duration::ZERO, delta: Delta::Text("我看一下。".into()) },
+        ScriptStep {
+            delay: Duration::ZERO,
+            delta: Delta::ToolCall(ToolCallDelta {
+                call_id: "c1".into(),
+                name: Some("exec".into()),
+                args_chunk: r#"{"command":"echo hi"}"#.into(),
+            }),
+        },
+        ScriptStep { delay: Duration::ZERO, delta: Delta::Done(FinishReason::ToolUse) },
+    ];
+    let provider = Arc::new(SequencedMock::new(vec![
+        round1,
+        streaming_reply(6, Duration::from_millis(150)),
+    ]));
+
+    let daemon = TestDaemon::builder("nat-resume-since", provider)
+        .map_cfg(|c| {
+            c.with_idle_timeout(Duration::from_secs(120))
+                .with_tools(exec_tools())
+                .with_auto_compact(false)
+        })
+        .start()
+        .await;
+    let base = spawn_gateway(daemon.transport(), 4).await;
+    let client = reqwest::Client::new();
+
+    let mut send_stream = client
+        .post(format!("{base}/api/v1/chat/send"))
+        .json(&serde_json::json!({ "session": "main", "text": "跑一下" }))
+        .send()
+        .await
+        .expect("send 应建立")
+        .bytes_stream();
+
+    // 消费到「工具已结束 + 第 2 轮已出至少一段」，确保 seq=2/3 都已落库打标。
+    let mut linebuf = String::new();
+    let mut run_id = None;
+    let mut tool_ended = false;
+    let mut round2_deltas = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), send_stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                linebuf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = linebuf.find('\n') {
+                    let line: String = linebuf.drain(..=pos).collect();
+                    let Some(p) = line.trim_end().strip_prefix("data: ") else { continue };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(p.trim()) else { continue };
+                    if let Some(id) = v.get("run_id").and_then(|i| i.as_str()) {
+                        run_id = Some(id.to_string());
+                    }
+                    match v.get("event").and_then(|e| e.as_str()) {
+                        Some("tool") => {
+                            if v.pointer("/phase/phase").and_then(|s| s.as_str()) == Some("end") {
+                                tool_ended = true;
+                            }
+                        }
+                        Some("assistant") if tool_ended => round2_deltas += 1,
+                        _ => {}
+                    }
+                }
+                if run_id.is_some() && tool_ended && round2_deltas >= 1 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let run_id = run_id.unwrap_or_else(|| panic!("未能取到 run_id：{linebuf}"));
+    assert!(tool_ended, "断连前工具轮应已结束并落库：{linebuf}");
+
+    drop(send_stream);
+
+    // seq 排布：1=user，2=assistant dispatch（含「我看一下。」+ tool_calls），3=tool result。
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/chat/resume?run_id={run_id}&session=main&since_seq=3"
+        ))
+        .send()
+        .await
+        .expect("resume 应建立");
+    assert_eq!(resp.status(), 200);
+    let sse = read_sse(resp, Duration::from_secs(15)).await;
+
+    assert!(sse.contains(r#""phase":"end""#), "resume 流应以 lifecycle end 终止：{sse}");
+    assert!(
+        !sse.contains("event: tool"),
+        "since_seq=3 之前的工具轮不该回放（参数没透传时会回放）：{sse}"
+    );
+    assert!(
+        !sse.contains("我看一下。"),
+        "seq=2 已含第 1 轮正文，不该回放：{sse}"
+    );
+    assert!(sse.contains("第5段。"), "第 2 轮剩余正文仍须续上：{sse}");
 }

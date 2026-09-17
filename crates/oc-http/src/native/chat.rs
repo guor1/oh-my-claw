@@ -38,6 +38,9 @@ pub struct ResumeQuery {
     pub run_id: String,
     #[serde(default)]
     pub session: Option<String>,
+    /// 客户端已渲染的历史水位（最大 entry seq）。缺省 0 = 全量回放。
+    #[serde(default)]
+    pub since_seq: i64,
 }
 
 /// POST /api/v1/chat/send  →  SSE stream of native `Event`s.
@@ -244,7 +247,7 @@ pub async fn resume(
     handshake(&mut conn).await?;
     send_req(
         &mut conn,
-        Method::ChatResume(ChatResumeParams { session: session.clone(), run_id: run_id.clone(), since_seq: 0 }),
+        Method::ChatResume(ChatResumeParams { session: session.clone(), run_id: run_id.clone(), since_seq: q.since_seq }),
         None,
     )
     .await?;
