@@ -294,6 +294,16 @@ export function applyToolEvent(sessionId, ev) {
     // step 边界：定格本 step 的文本气泡（见 ChatPane.submit 的 onTool 注释）。
     finalizeLastAssistant(sessionId)
     activityFor(sessionId).visible()
+    const list = messagesFor(sessionId)
+    const existing = list.find(x => x.id === `tool-${ev.call_id}`)
+    if (existing) {
+      // 刷新落在「dispatch 已落库、结果未落库」的窗口：loadHistory 已按 dispatch
+      // 建了一张 running 半卡，resume 回放的 Start 是同一个 call——认领它，别再建
+      // 一张（否则第二张永远转圈）。live 路径 call_id 唯一，不会走到这里。
+      existing.toolStatus = 'running'
+      existing.status = 'running'
+      return
+    }
     appendMessage(sessionId, {
       id: `tool-${ev.call_id}`,
       role: 'tool',
