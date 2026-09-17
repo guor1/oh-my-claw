@@ -74,6 +74,7 @@ impl RunLog {
     }
 
     /// 订阅并从头回放。等价于 `subscribe_from(0, replay_reasoning)`。
+    // 生产路径已全部改用 `subscribe_from`；此方法现仅测试在用，别在清理时误删。
     pub fn subscribe(&self, replay_reasoning: bool) -> mpsc::UnboundedReceiver<Event> {
         self.subscribe_from(0, replay_reasoning)
     }
