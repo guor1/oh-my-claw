@@ -483,3 +483,30 @@ async fn file_edit_append_respect_roots() {
         .await;
     assert!(e.is_err(), "append 根外路径应被拒");
 }
+
+/// 真机乱码回归：Windows Python 默认按 GBK 输出中文，旧实现按 UTF-8 lossy 解
+/// 会得到乱码、模型蒙眼 debug。设 PYTHONUTF8/PYTHONIOENCODING 后输出 UTF-8，
+/// decode_output 应原样还原中文。
+#[cfg(windows)]
+#[tokio::test]
+async fn exec_python_chinese_roundtrip_clean() {
+    use oc_tools::shell::Shell;
+
+    let tool = ExecTool::new(
+        ApprovalMode::Allow,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        Shell::resolve().unwrap(),
+    );
+    let cx = ToolCtx::detached(CancellationToken::new());
+    let out = tool
+        .invoke(serde_json::json!({ "command": "python -c \"print('中文测试')\"" }), cx)
+        .await
+        .expect("exec ok");
+    assert!(out.success, "python 应成功: {}", out.content);
+    assert!(
+        out.content.contains("中文测试"),
+        "中文输出不得乱码: {}",
+        out.content
+    );
+}
