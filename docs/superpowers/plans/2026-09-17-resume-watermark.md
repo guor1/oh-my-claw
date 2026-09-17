@@ -57,6 +57,21 @@ seq=146  ...
 
 ---
 
+## 对现有功能的影响面（实施前必须让需求方确认）
+
+| # | 被影响的功能 | 怎么变 | 兼容性 / 风险 |
+|---|---|---|---|
+| 1 | `oc-store` 的 `append_entry` **返回值语义** | 从 rowid 改成会话内 seq | 当前 workspace 内全部调用方都丢弃返回值（Task 1 Step 1 会逐条核实），**今天零行为变化**；但这是公开 API 的语义变更，日后有人按 rowid 用就会静默错位。已在函数文档里写明「返回 seq 而非 rowid」及原因 |
+| 2 | `chat.resume` **协议** | `ChatResumeParams` 新增 `since_seq` | 双向兼容。旧前端 → 新 daemon：字段缺失走 `serde(default)` = 0 = 全量回放（即今天的行为）。新前端 → 旧 daemon：`oc-proto` 未开 `deny_unknown_fields`（已核实），多余字段被忽略，同样退化为全量回放。**都不炸，最坏是这个特性不生效** |
+| 3 | `SessionHandle::resume` 签名 | 加一个 `since_seq` 参数 | crate 内部 API，唯一调用方 `dispatch.rs::handle_chat_resume`。无外部影响 |
+| 4 | **前端 `maybeResume` 的触发条件收紧** ⚠️ | 新增守卫：本会话 `loadHistory` 没成功跑过（水位为 `undefined`）就不发起 resume | **这是一处真实的功能收缩**：`loadHistory` 因 cookie 过期被 `handleAuthFailure` 吞掉时，原实现里 ambient `onStatus` 仍会触发一次 resume，改后不会。<br>判断：这条路径本就跟着跳登录门，resume 上去也没有历史可拼、只会全量回放再和随后重载的历史重复——正是本次要修的 bug。但行为确实变了，需求方须知情 |
+| 5 | `RunLog::subscribe(replay_reasoning)` | 保留，改为 `subscribe_from(0, ..)` 的薄壳 | 语义完全不变，既有 3 个单测与 `sink.rs` 单测原样通过 |
+| 6 | `RunSink::Conn` / `Broadcast`（TUI/CLI 路径） | `mark_persisted` 在这两个变体上是 no-op | 零行为变化、零额外开销（一次 match 判别）。Task 3 有专门用例守住「非 Detached 打标记不 panic」 |
+
+**不受影响**：run 驱动逻辑、落库内容与顺序、断连继续跑完（上一轮的 `Detached` 语义）、审批/ask_user、子会话、cron/主动性。
+
+---
+
 ## File Structure
 
 | 文件 | 职责变化 |
