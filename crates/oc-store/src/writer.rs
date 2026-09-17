@@ -241,6 +241,7 @@ macro_rules! writer_call {
 
 impl Writer {
     writer_call!(ensure_session(id: String, kind: String) -> () => EnsureSession { id, kind });
+    /// 追加 entry，返回其**会话内 seq**。
     writer_call!(append_entry(entry: NewEntry) -> i64 => AppendEntry { entry });
     writer_call!(reset_session(id: String) -> () => ResetSession { id });
     writer_call!(session_list() -> Vec<crate::types::SessionRow> => SessionList {});

@@ -310,6 +310,24 @@ mod tests {
         assert!(after.is_empty(), "reset 后上下文应为空");
     }
 
+    /// `append_entry` 返回的是会话内 seq（不是 rowid）——刷新接续的水位标记
+    /// 靠它定位「事件落进了哪条 entry」，返回 rowid 会在多会话下完全错位。
+    #[tokio::test]
+    async fn append_entry_returns_session_seq() {
+        use crate::types::{NewEntry, Role};
+        let store = Store::open_memory().expect("open");
+        let w = store.writer();
+        w.ensure_session("a".into(), "main".into()).await.unwrap();
+        w.ensure_session("b".into(), "main".into()).await.unwrap();
+
+        let a1 = w.append_entry(NewEntry::text("a", Role::User, "一", 1)).await.unwrap();
+        let a2 = w.append_entry(NewEntry::text("a", Role::Assistant, "二", 1)).await.unwrap();
+        // 会话 b 的第一条也必须是 seq=1；返回 rowid 的话这里会是 3。
+        let b1 = w.append_entry(NewEntry::text("b", Role::User, "三", 1)).await.unwrap();
+
+        assert_eq!((a1, a2, b1), (1, 2, 1), "返回值应为会话内 seq，而非全局 rowid");
+    }
+
     /// 工具调用结构可写可读（P2-4）。这两列缺了，重放就只能把工具结果降级成
     /// user 文本，模型学会「宣布完就等人贴结果」。
     #[tokio::test]

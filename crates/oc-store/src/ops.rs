@@ -25,7 +25,10 @@ pub fn ensure_session(conn: &Connection, id: &str, kind: &str) -> StoreResult<()
     Ok(())
 }
 
-/// 追加一条 entry，seq 在会话内单调递增。返回新行 id。
+/// 追加一条 entry，seq 在会话内单调递增。**返回该 entry 的 seq**（不是 rowid）。
+///
+/// 返回 seq 而非 rowid：唯一的消费者是刷新接续的水位标记（`RunSink::mark_persisted`），
+/// 它要答的是「事件落进了哪条 entry」——rowid 是全局的，跨会话完全错位。
 pub fn append_entry(conn: &Connection, e: &NewEntry) -> StoreResult<i64> {
     // 下一个 seq = 当前最大 + 1（同会话）。
     let next_seq: i64 = conn
@@ -52,7 +55,7 @@ pub fn append_entry(conn: &Connection, e: &NewEntry) -> StoreResult<i64> {
             now_millis()
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(next_seq)
 }
 
 /// 列出所有会话，按创建时间倒序（最近的在前）。
