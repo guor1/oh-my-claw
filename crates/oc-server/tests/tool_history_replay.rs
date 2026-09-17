@@ -12,9 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oc_llm::mock::CapturingMock;
+use oc_llm::mock::{ScriptStep, SequencedMock};
+use oc_llm::types::ToolCallDelta;
+use oc_llm::{Delta, FinishReason};
 use oc_proto::{Event, LifecyclePhase};
 use oc_server::session::{self, SessionConfig};
 use oc_server::testing::{test_cfg, SessionConfigExt};
+use oc_server::tools_bridge::ToolExecutor;
+use oc_tools::ToolRegistry;
 use tokio::sync::broadcast;
 
 fn cfg() -> SessionConfig {
@@ -277,5 +282,121 @@ async fn strips_dangling_dispatch() {
     assert!(
         sent.iter().any(|m| m.content == "我跑一下命令。"),
         "文本本身是模型说过的话，应保留: {sent:?}"
+    );
+}
+
+/// 已落库的空工具名不得原样重放——那正是 provider 400、会话永久卡死的来源。
+/// 重放时替换成哨兵 `unknown_tool`，结构保持「dispatch + 结果」成对，模型能看懂。
+#[tokio::test]
+async fn replay_sanitizes_empty_tool_name() {
+    let store = oc_store::Store::open_memory().unwrap();
+    let w = store.writer();
+    w.ensure_session("main".into(), "main".into()).await.unwrap();
+
+    w.append_entry(oc_store::NewEntry::text("main", oc_store::Role::User, "跑一下", 3))
+        .await
+        .unwrap();
+    // 真机脏数据的形状：name 为空串、args 却是完整的 exec 参数。
+    w.append_entry(oc_store::NewEntry {
+        tool_calls: Some(r#"[{"id":"call_bad","name":"","args":"{\"command\":\"ls\"}"}]"#.into()),
+        ..oc_store::NewEntry::text("main", oc_store::Role::Assistant, "", 1)
+    })
+    .await
+    .unwrap();
+    w.append_entry(oc_store::NewEntry {
+        tool_call_id: Some("call_bad".into()),
+        ..oc_store::NewEntry::text("main", oc_store::Role::Tool, "未知工具: ", 2)
+    })
+    .await
+    .unwrap();
+
+    let sent = messages_sent_after_seeding(store).await;
+
+    let dispatch = sent
+        .iter()
+        .find(|m| m.role == oc_llm::MsgRole::Assistant && !m.tool_calls.is_empty())
+        .unwrap_or_else(|| panic!("应重放出带 tool_calls 的 assistant: {sent:?}"));
+    assert_eq!(dispatch.tool_calls[0].id, "call_bad");
+    assert_eq!(
+        dispatch.tool_calls[0].name, "unknown_tool",
+        "空工具名必须替换成哨兵，否则回喂 400: {sent:?}"
+    );
+    assert!(
+        !sent.iter().any(|m| m.tool_calls.iter().any(|tc| tc.name.is_empty())),
+        "到达模型的消息里不得有空函数名: {sent:?}"
+    );
+}
+
+/// 模型在途吐出空工具名：不落 `""`，落哨兵；工具桥回「未知工具: unknown_tool」；
+/// 下一轮回喂的 assistant 消息函数名非空（不再 400）。
+#[tokio::test]
+async fn empty_tool_name_from_model_is_sanitized_before_persist() {
+    let round1 = vec![
+        ScriptStep {
+            delay: Duration::ZERO,
+            delta: Delta::ToolCall(ToolCallDelta {
+                call_id: "call_x".into(),
+                name: Some(String::new()), // 真机：function.name = ""
+                args_chunk: r#"{"command":"ls"}"#.into(),
+            }),
+        },
+        ScriptStep { delay: Duration::ZERO, delta: Delta::Done(FinishReason::ToolUse) },
+    ];
+    let round2 = vec![
+        ScriptStep { delay: Duration::ZERO, delta: Delta::Text("好的。".into()) },
+        ScriptStep { delay: Duration::ZERO, delta: Delta::Done(FinishReason::Stop) },
+    ];
+    let provider = Arc::new(SequencedMock::new(vec![round1, round2]));
+    let captures = provider.captures();
+
+    let store = oc_store::Store::open_memory().unwrap();
+    store.writer().ensure_session("main".into(), "main".into()).await.unwrap();
+
+    // 空注册表：任何名字都是「未知工具」，正好走到 tools_bridge 的那条分支。
+    let tools = ToolExecutor::new(Arc::new(ToolRegistry::new()));
+    let (tx, mut rx) = broadcast::channel(512);
+    let sid = oc_proto::SessionId::main();
+    let handle = session::spawn(
+        sid.clone(),
+        cfg().with_tools(tools),
+        provider,
+        tx,
+        store.clone(),
+        oc_server::diag::DiagRegistry::new().for_session(&sid),
+    );
+    handle.submit("跑一下".into(), handle.broadcast_sink()).await.expect("run");
+    wait_terminal(&mut rx, Duration::from_secs(5)).await;
+
+    // ① 回喂第 2 轮的请求里，assistant 的函数名是哨兵而非空串。
+    let reqs = captures.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "应有两轮模型请求（工具轮 + 收尾）");
+    let dispatch = reqs[1]
+        .messages
+        .iter()
+        .find(|m| !m.tool_calls.is_empty())
+        .expect("第 2 轮请求应含工具调用历史");
+    assert_eq!(dispatch.tool_calls[0].name, "unknown_tool");
+    let result = reqs[1]
+        .messages
+        .iter()
+        .find(|m| m.role == oc_llm::MsgRole::Tool)
+        .expect("应有工具结果");
+    assert!(
+        result.content.contains("未知工具: unknown_tool"),
+        "工具桥应报出哨兵名，实际: {}",
+        result.content
+    );
+    drop(reqs);
+
+    // ② 落库的 dispatch 也是哨兵（否则下次重放又毒化）。
+    let hist = store.writer().load_transcript("main".into(), 100).await.unwrap();
+    let persisted = hist
+        .iter()
+        .find(|e| e.role == oc_store::Role::Assistant && e.tool_calls.is_some())
+        .expect("应落库一条带 tool_calls 的 assistant");
+    assert!(
+        persisted.tool_calls.as_deref().unwrap().contains(r#""name":"unknown_tool""#),
+        "落库的工具名应为哨兵: {:?}",
+        persisted.tool_calls
     );
 }

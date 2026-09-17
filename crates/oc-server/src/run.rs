@@ -28,6 +28,13 @@ use crate::tools_bridge::ToolExecutor;
 const LOOP_REPEAT_THRESHOLD: usize = 3;
 /// 单个 run 内最大工具轮数（兜底，防无限工具循环）。
 const MAX_TOOL_ROUNDS: usize = 24;
+/// 模型吐出空工具名时的哨兵。
+///
+/// 空函数名回喂 provider 必 400（OpenAI 函数名规则 `^[a-zA-Z0-9_-]{1,64}$`），
+/// 而这条 assistant 一旦落库，之后每一轮重放都 400——会话就此卡死。
+/// 与旁边空 `call_id` → `gen_call_id()` 同一思路：结构保持合法，让工具桥回一条
+/// 「未知工具: unknown_tool」，模型看到明确报错会自行重发。
+pub(crate) const UNKNOWN_TOOL_NAME: &str = "unknown_tool";
 /// 输出被 max_tokens 截断后，最多再续写几轮。
 ///
 /// 超过就报 `Truncated`——再续下去多半是模型每轮都把预算烧在 reasoning 上，
@@ -631,6 +638,17 @@ async fn run_model_turn(
                 }
             }
             Delta::Done(FinishReason::ToolUse) => {
+                // 空工具名兜底：见 UNKNOWN_TOOL_NAME。
+                let tc_name = if tc_name.is_empty() {
+                    warn!(
+                        run_id = %ctx.run_id,
+                        args_chars = tc_args.chars().count(),
+                        "模型返回空工具名，替换为哨兵 {UNKNOWN_TOOL_NAME}"
+                    );
+                    UNKNOWN_TOOL_NAME.to_string()
+                } else {
+                    tc_name
+                };
                 // 有工具调用。
                 tracing::debug!(
                     tool = %tc_name,

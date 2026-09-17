@@ -718,8 +718,18 @@ fn entry_to_message(e: &oc_store::Entry) -> oc_llm::Message {
             let specs: Vec<oc_llm::ToolCallSpec> = e
                 .tool_calls
                 .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
+                .and_then(|s| serde_json::from_str::<Vec<oc_llm::ToolCallSpec>>(s).ok())
+                .unwrap_or_default()
+                .into_iter()
+                // 已落库的空工具名（哨兵引入前的脏数据）重放前替换掉：
+                // 否则每一轮都 400，会话卡死到压缩为止。见 run::UNKNOWN_TOOL_NAME。
+                .map(|mut s: oc_llm::ToolCallSpec| {
+                    if s.name.is_empty() {
+                        s.name = crate::run::UNKNOWN_TOOL_NAME.to_string();
+                    }
+                    s
+                })
+                .collect();
             oc_llm::Message {
                 tool_calls: specs,
                 ..plain(oc_llm::MsgRole::Assistant)
