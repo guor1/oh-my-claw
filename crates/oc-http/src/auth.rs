@@ -196,7 +196,7 @@ pub fn check_bind_requires_token(addr: &std::net::SocketAddr, token: &Option<Str
     // `Some("")` (or a whitespace-only token) is treated as "no credential",
     // because `Authorization: Bearer ` with an empty credential would match it
     // and leave the daemon effectively unauthenticated on the network.
-    let has_token = token.as_deref().map_or(false, |t| !t.trim().is_empty());
+    let has_token = token.as_deref().is_some_and(|t| !t.trim().is_empty());
     if !ip.is_loopback() && !has_token {
         return Err(format!(
             "binding to {addr} exposes the daemon to the network; \

@@ -87,17 +87,12 @@ pub enum MethodOk {
 ///   （原有语义，对应 `RunSink::Conn` 的 `closed()` 探测）。
 /// - `Detached`：Web / HTTP 无状态网关。run 归属会话而非连接，断连不中止——
 ///   客户端刷新页面后 run 继续跑完并落库（对齐 OpenClaw 的 delivery-key 解耦）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientKind {
+    #[default]
     Interactive,
     Detached,
-}
-
-impl Default for ClientKind {
-    fn default() -> Self {
-        ClientKind::Interactive
-    }
 }
 
 impl ClientKind {

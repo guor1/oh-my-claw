@@ -118,6 +118,12 @@ impl RunLog {
     }
 }
 
+impl Default for RunLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

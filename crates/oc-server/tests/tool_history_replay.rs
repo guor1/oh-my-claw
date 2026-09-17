@@ -368,25 +368,27 @@ async fn empty_tool_name_from_model_is_sanitized_before_persist() {
     wait_terminal(&mut rx, Duration::from_secs(5)).await;
 
     // ① 回喂第 2 轮的请求里，assistant 的函数名是哨兵而非空串。
-    let reqs = captures.lock().unwrap();
-    assert_eq!(reqs.len(), 2, "应有两轮模型请求（工具轮 + 收尾）");
-    let dispatch = reqs[1]
-        .messages
-        .iter()
-        .find(|m| !m.tool_calls.is_empty())
-        .expect("第 2 轮请求应含工具调用历史");
-    assert_eq!(dispatch.tool_calls[0].name, "unknown_tool");
-    let result = reqs[1]
-        .messages
-        .iter()
-        .find(|m| m.role == oc_llm::MsgRole::Tool)
-        .expect("应有工具结果");
-    assert!(
-        result.content.contains("未知工具: unknown_tool"),
-        "工具桥应报出哨兵名，实际: {}",
-        result.content
-    );
-    drop(reqs);
+    //    断言放进独立作用域：guard 不得跨下面 load_transcript 的 await（clippy）。
+    {
+        let reqs = captures.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "应有两轮模型请求（工具轮 + 收尾）");
+        let dispatch = reqs[1]
+            .messages
+            .iter()
+            .find(|m| !m.tool_calls.is_empty())
+            .expect("第 2 轮请求应含工具调用历史");
+        assert_eq!(dispatch.tool_calls[0].name, "unknown_tool");
+        let result = reqs[1]
+            .messages
+            .iter()
+            .find(|m| m.role == oc_llm::MsgRole::Tool)
+            .expect("应有工具结果");
+        assert!(
+            result.content.contains("未知工具: unknown_tool"),
+            "工具桥应报出哨兵名，实际: {}",
+            result.content
+        );
+    }
 
     // ② 落库的 dispatch 也是哨兵（否则下次重放又毒化）。
     let hist = store.writer().load_transcript("main".into(), 100).await.unwrap();
